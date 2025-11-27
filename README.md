@@ -10,7 +10,9 @@ Flood-prediction environments evolve over time due to changing weather patterns 
 3. `pip install -r requirements.txt`
 
 ## How to run
-`python3 offline_learn.py` (or `python offline_learn.py`) 
+1. `python3 offline_learn.py` (or `python offline_learn.py`)
+2. run each cell in `online_learn.ipynb` file
+3. if you want to visualize the experiment run `experiments.ipynb`
 
 ## Additional context
-We build on the Hydro-informer work (`hydro_informer_paper.pdf`), using their river-level records and motivation for handling irregular data. This repository focuses on the Bardejov station and pairs that data with online-learning experiments so readers can compare real-time adaptability against the standard offline workflow.
+We build on the Hydro-informer work (https://github.com/Wael-Mikaeel/Hydro-informer), using their river-level records and motivation for handling irregular data. This repository focuses on the Bardejov station and pairs that data with online-learning experiments so readers can compare real-time adaptability against the standard offline workflow.
