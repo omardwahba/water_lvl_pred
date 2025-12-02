@@ -504,10 +504,10 @@ def calculate_metrics_and_plot(result_dict, plot_title, plotly_theme='simple_whi
             plt.legend()
             plt.grid(True, alpha=0.3)
             plt.tight_layout()
-        
-        plt.savefig(png_path, dpi=150)
+        if export_file_name is not None:
+            plt.savefig(png_path, dpi=150)
+            print(f"Saved PNG: {png_path}")
         plt.show()
-        print(f"Saved PNG: {png_path}")
     except Exception as e:
         print(f"Warning: could not save PNG to {png_path}: {e}")
             
