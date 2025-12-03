@@ -18,7 +18,10 @@ from torch.utils.data import DataLoader
 import plotly.express as px
 from plotly_resampler import FigureResampler
 import matplotlib.pyplot as plt
+import seaborn as sns
 import os
+import itertools
+
 
 EPSILON = 1e-6  # For numerical stability in normalization
 
@@ -62,8 +65,6 @@ class RollingNormTimeSeriesDataset(Dataset):
         max_vals, _ = torch.max(x_raw, dim=0)
         # Add epsilon for stability (to avoid division by zero if max==min)
         range_vals = max_vals - min_vals + self.epsilon
-        
-        # 2. Normalize X (all 4 features)
         x_scaled = (x_raw - min_vals) / range_vals
         
         # 3. Compute H_bar stats using both the lookback X window and the future y window
@@ -74,8 +75,6 @@ class RollingNormTimeSeriesDataset(Dataset):
         h_bar_min = torch.min(min_vals[self.h_bar_index], y_min)
         h_bar_max = torch.max(max_vals[self.h_bar_index], y_max)
         h_bar_range = h_bar_max - h_bar_min + self.epsilon
-
-        # 4. Normalize y (target H_bar) using the combined stats
         y_scaled = (y_raw - h_bar_min) / h_bar_range
 
         # Return everything needed for training and unscaling
@@ -336,7 +335,7 @@ def train_model_offline(x, y, x_test, y_test, testing_timestep, model, optimizer
 
 def model_evaluate_with_norm(model,criterion , 
                             dataset, ds_timesteps,
-                            lookback, horizon, batch_size=1, ):
+                            lookback, horizon, batch_size=1 ):
     ''' Evaluate a trained model on normalized test data and return unnormalized predictions.
     Args:
         model (torch.nn.Module): Trained model.
@@ -377,7 +376,8 @@ def model_evaluate_with_norm(model,criterion ,
 ################ Metrics & Plotting Functions ##########
 #######################################################
 def calculate_metrics_and_plot(result_dict, plot_title, plotly_theme='simple_white',
-                               export_html=False,export_metrics=False, export_file_name=None):
+                               export_html=False, export_metrics=False, export_file_name=None,
+                               methods_to_plot=None, use_seaborn_plot=True):
     ''' Calculate metrics and plot results from multiple methods.
     Args:
         result_dict (dict): Dictionary where keys are method names and values are tuples of
@@ -385,14 +385,18 @@ def calculate_metrics_and_plot(result_dict, plot_title, plotly_theme='simple_whi
         plot_title (str): Title for the plot.
         plotly_theme (str): Plotly theme for the plot.
         export_html (bool): Whether to export the plot as an HTML file.
-        export_file_name (str): Filename for the exported HTML/PNG/CSV file (if exporting).
         export_metrics (bool): Whether to append the calculated metrics to a CSV file
-                               next to the exported files. If the CSV doesn't exist it
-                               will be created. The CSV filename is derived from
-                               `export_file_name` with a `.csv` extension.
+                               next to the exported files.
+        export_file_name (str): Filename for the exported HTML/PNG/CSV file (if exporting).
+        methods_to_plot (list or None): List of method names (dictionary keys) to plot together.
+                                         If None, all methods are plotted.
+        use_seaborn_plot (bool): If True, use seaborn lineplot for static PNG; if False, use matplotlib directly.
     '''
     metrics_dict = {}
     df_all = []
+    # distinct_palette: use the same colors of matplotlib 'tab10' for consistency
+    distinct_palette = itertools.cycle(['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728',
+                                     '#9467bd', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf'])
     for method_name, (y_true, y_pred, time_steps) in result_dict.items():
         rmse = root_mean_squared_error(y_true, y_pred)
         mae = mean_absolute_error(y_true, y_pred)
@@ -428,23 +432,36 @@ def calculate_metrics_and_plot(result_dict, plot_title, plotly_theme='simple_whi
     df_all["Timestamp"] = pd.to_datetime(df_all["Timestamp"])
     df_all = df_all.sort_values(by="Timestamp")
 
-    # ---- Plot everything together ----
+    # Filter df_all based on methods_to_plot (for both Plotly and PNG)
+    if methods_to_plot is None:
+        methods_to_plot = list(result_dict.keys())
+    
+    # Filter to include selected methods + True
+    selected_legends = ['True'] + [f'Pred - {m}' for m in methods_to_plot if m in result_dict]
+    df_plot_data = df_all[df_all['Legend'].isin(selected_legends)].copy()
+
+    # ---- Plot everything together with Plotly ----
+    # 1. Create the base figure
     fig_base = px.line(
-        df_all,
+        df_plot_data,
         x="Timestamp",
         y="H_bar Value",
-        color="Legend",     # will show: True, Pred - Adam, Pred - RMSProp, ...
+        color="Legend",
         title=plot_title,
         labels={"H_bar Value": "H̅ (Water Level)"}
     )
+    for trace in fig_base.data:
+        trace.line.color = next(distinct_palette) # Cycle distinct colors
+        trace.line.width = 2      # Thinner
+
+
     fig_base.update_layout(
         template=plotly_theme,
         legend_title_text="Series",
         height=550
     )
-    # Wrap the figure with FigureResampler (for performance with large data)
-    # default_n_shown_samples: number of points to render per trace (downsampled view)
 
+    # Wrap the figure with FigureResampler
     fig = FigureResampler(fig_base, default_n_shown_samples=1000)
     fig.show()
     if export_html:
@@ -452,7 +469,7 @@ def calculate_metrics_and_plot(result_dict, plot_title, plotly_theme='simple_whi
             raise ValueError("export_file_name must be provided when export_html is True.")
         fig_base.write_html(f"{export_file_name}.html")
 
-    # --- Always save a static matplotlib PNG using the same base filename ---
+    # --- Save a static PNG using seaborn or matplotlib ---
     # Determine base filename and directory
     if export_file_name is not None:
         base_name = os.path.splitext(os.path.basename(export_file_name))[0]
@@ -465,23 +482,46 @@ def calculate_metrics_and_plot(result_dict, plot_title, plotly_theme='simple_whi
     png_path = os.path.join(target_dir, base_name + '.png')
 
     try:
-        plt.figure(figsize=(12, 5))
-        for legend in df_all['Legend'].unique():
-            sub = df_all[df_all['Legend'] == legend]
-            plt.plot(sub['Timestamp'], sub['H_bar Value'], label=legend)
-        plt.title(plot_title)
-        plt.xlabel('Timestamp')
-        plt.ylabel('H̅ (Water Level)')
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(png_path)
+        if use_seaborn_plot:
+            # Use seaborn lineplot for better-looking plots
+            plt.figure(figsize=(12, 5))
+            sns.set_style("darkgrid")
+            sns.lineplot(data=df_plot_data, x='Timestamp', y='H_bar Value', hue='Legend', linewidth=2, errorbar=None)
+            plt.title(plot_title, fontsize=14)
+            plt.xlabel('Timestamp', fontsize=12)
+            plt.ylabel('H̅ (Water Level)', fontsize=12)
+            plt.legend(title='Series', fontsize=10)
+            plt.tight_layout()
+        else:
+            # Use matplotlib directly
+            plt.figure(figsize=(12, 5))
+            for legend in df_plot_data['Legend'].unique():
+                sub = df_plot_data[df_plot_data['Legend'] == legend]
+                plt.plot(sub['Timestamp'], sub['H_bar Value'], label=legend)
+            plt.title(plot_title)
+            plt.xlabel('Timestamp')
+            plt.ylabel('H̅ (Water Level)')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+        if export_file_name is not None:
+            plt.savefig(png_path, dpi=150)
+            print(f"Saved PNG: {png_path}")
         plt.show()
-        print(f"Saved matplotlib PNG: {png_path}")
     except Exception as e:
-        print(f"Warning: could not save matplotlib PNG to {png_path}: {e}")
-
+        print(f"Warning: could not save PNG to {png_path}: {e}")
+            
     # --- Optionally export metrics to CSV (append mode) ---
     if export_metrics:
+        # Determine base filename and directory
+        if export_file_name is not None:
+            base_name = os.path.splitext(os.path.basename(export_file_name))[0]
+            target_dir = os.path.dirname(export_file_name) or '.'
+        else:
+            # sanitize plot_title to create a safe filename
+            base_name = ''.join(c if c.isalnum() or c in (' ', '-', '_') else '_' for c in plot_title).strip()
+            target_dir = '.'
+
         if export_file_name is None:
             raise ValueError("export_file_name must be provided when export_metrics is True.")
         csv_path = os.path.join(target_dir, base_name + '.csv')
@@ -503,25 +543,44 @@ def calculate_metrics_and_plot(result_dict, plot_title, plotly_theme='simple_whi
         except Exception as e:
             print(f"Warning: could not write metrics CSV to {csv_path}: {e}")
 
-def plot_one_series(x,y,title,x_label,y_label,plotly_theme='simple_white'):
-    ''' Plot a single time series using Plotly.
-    Args:
-        x (array-like): X-axis values (e.g., timestamps).
-        y (array-like): Y-axis values (e.g., measurements).
-        title (str): Title of the plot.
-        x_label (str): Label for the X-axis.
-        y_label (str): Label for the Y-axis.
-        plotly_theme (str): Plotly theme for the plot.
-    '''
-    fig = px.line(
-        x=x,
-        y=y,
-        title=title,
-        labels={"x": x_label, "y": y_label}
-    )
-    fig.update_layout(
-        template=plotly_theme,
-        height=500
-    )
-    fig.show()
+
+def export_results_to_csv(result_dict, export_file_name):
+    ''' Export results (timestamp, y_true, y_predictions) to separate CSV files per method.
     
+    Args:
+        result_dict (dict): Dictionary where keys are method names and values are tuples of
+                            (y_true, y_pred, time_steps).
+        export_file_name (str): Base filename for the exported CSV files (with or without .csv extension).
+                                Method name will be appended before the .csv extension.
+    
+    Behavior:
+        Creates a separate CSV file for each method with columns:
+        - Timestamp: index derived from time_steps
+        - True: ground truth values
+        - Prediction: predictions for the method
+        
+        Saves files as: <export_file_name>_<method_name>.csv
+    '''
+    # Remove .csv extension if present to avoid duplication
+    if export_file_name.endswith('.csv'):
+        base_name = export_file_name[:-4]
+    else:
+        base_name = export_file_name
+    
+    # Save a separate CSV for each method
+    for method_name, (y_true, y_pred, time_steps) in result_dict.items():
+        df = pd.DataFrame({
+            'Timestamp': time_steps,
+            'True': y_true,
+            'Prediction': y_pred
+        })
+        df['Timestamp'] = pd.to_datetime(df['Timestamp'])
+        df = df.set_index('Timestamp').sort_index()
+        
+        csv_filename = f"{base_name}_{method_name}.csv"
+        
+        try:
+            df.to_csv(csv_filename)
+            print(f"Exported results to CSV: {csv_filename}")
+        except Exception as e:
+            print(f"Warning: could not write results to CSV {csv_filename}: {e}")

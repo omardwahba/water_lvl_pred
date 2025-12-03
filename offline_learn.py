@@ -48,7 +48,6 @@ for j in range(num_test_samples):
 	idxs = test_ds.index[start_idx:end_idx]
 	test_timestamps.extend(list(idxs))
 
-# Train / evaluate each model and collect results
 results = {}
 
 # Prepare models description file (overwrite)
@@ -92,7 +91,10 @@ for name, builder, needs_flatten in model_builders:
 uf.calculate_metrics_and_plot(results, plot_title="Offline Models Comparison",
 							export_metrics=True,
 							export_html=True,
-							export_file_name= "results/testing/offline_models_testing_results")
+							export_file_name= "results/testing/offline/offline_models_testing_results")
+
+# Save predictions to CSV files to be used later in Experiments
+uf.export_results_to_csv(results, "results/testing/predictions_vs_true/offline")
 
 
 
