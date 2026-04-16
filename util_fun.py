@@ -67,19 +67,62 @@ class RollingNormTimeSeriesDataset(Dataset):
         range_vals = max_vals - min_vals + self.epsilon
         x_scaled = (x_raw - min_vals) / range_vals
         
-        # 3. Compute H_bar stats using both the lookback X window and the future y window
-        #    so min/max for H_bar considers values from both x_raw[:, h_bar_index] and y_raw.
-        y_min = torch.min(y_raw)
-        y_max = torch.max(y_raw)
-
-        h_bar_min = torch.min(min_vals[self.h_bar_index], y_min)
-        h_bar_max = torch.max(max_vals[self.h_bar_index], y_max)
-        h_bar_range = h_bar_max - h_bar_min + self.epsilon
+        # 3. Compute H_bar stats using only the lookback X window.
+        #    Using future y values to compute scaling stats would leak information
+        #    from the prediction window into training/inference.
+        h_bar_min = min_vals[self.h_bar_index]
+        h_bar_range = range_vals[self.h_bar_index]
         y_scaled = (y_raw - h_bar_min) / h_bar_range
 
         # Return everything needed for training and unscaling
         return x_scaled, y_scaled, h_bar_min, h_bar_range
     
+class ZScoreNormTimeSeriesDataset(Dataset):
+    """
+    A PyTorch Dataset that applies per-window z-score (standardization) normalization.
+    For each sample, X and y are normalized using the mean and std computed
+    *only* from the lookback window — no future data leakage.
+
+    Why z-score over min-max for online learning:
+    - Min-max maps the lookback to [0,1], so any future value outside that range
+      produces unbounded scaled targets (e.g. y_scaled = 10 or -5).
+    - Z-score centers on 0 with unit variance. A future value far from the
+      lookback mean is still only a few standard deviations away, producing
+      much smaller and more stable normalized targets.
+
+    Returns the same (x_scaled, y_scaled, h_bar_mean, h_bar_std) interface so
+    the existing train/eval functions work — just swap mean/std for min/range
+    when unscaling: y_true = y_scaled * h_bar_std + h_bar_mean
+    """
+    def __init__(self, X_seq, y_seq, h_bar_index, epsilon=EPSILON):
+        self.X_seq = torch.tensor(X_seq, dtype=torch.float32)
+        self.y_seq = torch.tensor(y_seq, dtype=torch.float32)
+        self.h_bar_index = h_bar_index
+        self.epsilon = epsilon
+
+    def __len__(self):
+        return len(self.X_seq)
+
+    def __getitem__(self, idx):
+        x_raw = self.X_seq[idx]  # Shape: (lookback, n_features)
+        y_raw = self.y_seq[idx]  # Shape: (horizon,)
+
+        # Per-feature mean and std from the lookback window only
+        mean_vals = torch.mean(x_raw, dim=0)            # shape (n_features,)
+        std_vals  = torch.std(x_raw, dim=0) + self.epsilon  # shape (n_features,)
+
+        x_scaled = (x_raw - mean_vals) / std_vals
+
+        # H_bar stats for y normalization and later unscaling
+        h_bar_mean = mean_vals[self.h_bar_index]
+        h_bar_std  = std_vals[self.h_bar_index]
+        y_scaled = (y_raw - h_bar_mean) / h_bar_std
+
+        # Return same 4-tuple interface: (x_scaled, y_scaled, center, scale)
+        # Unscaling: y_true = y_scaled * h_bar_std + h_bar_mean
+        return x_scaled, y_scaled, h_bar_mean, h_bar_std
+
+
 def create_sequences(data, lookback, horizon, target_value_index):
     ''' Create input-output sequences using sliding window approach.
     Args:
@@ -115,6 +158,7 @@ def create_sequences(data, lookback, horizon, target_value_index):
 def train_model_online(model, optimizer, criterion,
                        dataset, df,
                        LOOKBACK, HORIZON, batch_size,
+                       max_grad_norm=None,  # gradient clipping max norm (e.g. 1.0)
                        use_amnesia_strategy=False, amnesia_threshold=2.5, amnesia_warmup_batches=10,
                        amnesia_new_lr=None,   # <-- NEW: LR to set *during* a spike
                        amnesia_reset_lr=None): # <-- NEW: The original LR to return to
@@ -192,6 +236,8 @@ def train_model_online(model, optimizer, criterion,
         # 3. Backward pass and optimize (Original)
         optimizer.zero_grad()
         loss.backward()
+        if max_grad_norm is not None:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
         optimizer.step()
         
         if (i+1) % 100 == 0:
@@ -357,13 +403,13 @@ def model_evaluate_with_norm(model,criterion ,
             y_pred_scaled = model(x_batch_scaled)
             
             # --- Data Unscaling & Storage (Original) ---
-            h_range_u, h_min_u = h_range.unsqueeze(-1), h_min.unsqueeze(-1)
-            y_pred_true = (y_pred_scaled * h_range_u + h_min_u).detach().cpu().numpy()
-            y_unscaled =  (y_batch_scaled * h_range_u + h_min_u).detach().cpu().numpy()
-            y_predictions = np.concatenate((y_predictions, y_pred_true), axis=1)
-            y_ground_truth = np.concatenate((y_ground_truth, y_unscaled), axis=1)
-            idx_start, idx_end = (i*horizon) + lookback, (i*horizon) + lookback + horizon
-            all_indices = np.concatenate((all_indices, ds_timesteps[idx_start:idx_end]))
+            h_range_u, h_min_u  = h_range.unsqueeze(-1), h_min.unsqueeze(-1)
+            y_pred_true         = (y_pred_scaled * h_range_u + h_min_u).detach().cpu().numpy()
+            y_unscaled          = (y_batch_scaled * h_range_u + h_min_u).detach().cpu().numpy()
+            y_predictions       = np.concatenate((y_predictions, y_pred_true), axis=1)
+            y_ground_truth      = np.concatenate((y_ground_truth, y_unscaled), axis=1)
+            idx_start, idx_end  = (i*horizon) + lookback, (i*horizon) + lookback + horizon
+            all_indices         = np.concatenate((all_indices, ds_timesteps[idx_start:idx_end]))
 
             # 2. Calculate loss (on scaled data)
             loss = criterion(y_pred_scaled, y_batch_scaled)
