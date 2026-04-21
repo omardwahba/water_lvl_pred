@@ -80,22 +80,28 @@ class RollingNormTimeSeriesDataset(Dataset):
         # Return everything needed for training and unscaling
         return x_scaled, y_scaled, h_bar_min, h_bar_range
     
-def create_sequences(data, lookback, horizon, target_value_index):
+def create_sequences(data, lookback, horizon, target_value_index, step = None):
     ''' Create input-output sequences using sliding window approach.
     Args:
         data (np.array): The raw data array.
         lookback (int): Number of past time steps to use as input.
         horizon (int): Number of future time steps to predict.
         h_bar_index (int): Index of the H_bar feature in the data.
+        step (int or None): step size for sliding window(the timestamps):
+            - None/horizon: the original behavior - y[n] appears in X[n+1] --> the leakage
+            - lookback+ horizon : no overlap between X and y windows, but more samples (under test).
     Returns:
         X (np.array): Input sequences of shape (num_samples, lookback, num_features).
         y (np.array): Output sequences of shape (num_samples, horizon).
     '''
+    if step is None:
+        step = horizon
+
     X, y = [], []
     print("Creating sequences...")
-    print(f"Data length: {len(data)}, lookback: {lookback}, horizon: {horizon}")
+    print(f"Data length: {len(data)}, lookback: {lookback}, horizon: {horizon} , step: {step}")
     
-    for i in range(0, len(data), horizon):
+    for i in range(0, len(data), step):
         
         historical_data = data[i:(i + lookback), :]
         future_y = data[(i + lookback):(i + lookback + horizon), target_value_index]
@@ -486,7 +492,7 @@ def calculate_metrics_and_plot(result_dict, plot_title, plotly_theme='simple_whi
             # Use seaborn lineplot for better-looking plots
             plt.figure(figsize=(12, 5))
             sns.set_style("darkgrid")
-            sns.lineplot(data=df_plot_data, x='Timestamp', y='H_bar Value', hue='Legend', linewidth=2, errorbar=None)
+            sns.lineplot(data=df_plot_data, x='Timestamp', y='H_bar Value', hue='Legend', style='Legend', palette='tab20', linewidth=2, errorbar=None)
             plt.title(plot_title, fontsize=14)
             plt.xlabel('Timestamp', fontsize=12)
             plt.ylabel('H̅ (Water Level)', fontsize=12)
