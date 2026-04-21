@@ -9,6 +9,7 @@ from .lstm import build as build_lstm
 from .cnn import build as build_cnn
 from .gru import build as build_gru
 from .logistic import build as build_logistic
+from .ftrl import FTRL
 
 def get_model_describtion(model):
 	"""Return a human-readable description of a PyTorch model's trainable parameters.
@@ -51,5 +52,6 @@ __all__ = [
 	"build_gru",
 	"build_logistic",
     "get_model_describtion",
+    "FTRL",
 ]
 

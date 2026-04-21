@@ -9,13 +9,18 @@
 
 The optimizer doesn't matter if `y_scaled` is exploding. Fix this first.
 
-- [ ] **1.1 Percentile-based min-max** — use 5th–95th percentile of lookback instead of strict min/max
-  - Replace `torch.min/max` in `RollingNormTimeSeriesDataset` with `torch.quantile(x_raw, 0.05/0.95)`
-  - Prevents one-sample outliers in the lookback from compressing the range
+- [x] **1.1 Percentile-based min-max** — `PercentileNormTimeSeriesDataset` added to `util_fun.py`
+  - Uses `torch.quantile(x_raw, 0.05/0.95)` per feature; y_scaled clamped to [-5, 5]
 
-- [ ] **1.2 Clip y_scaled** — after computing `y_scaled`, hard-clip to `[-5, 5]`
-  - Quick, zero-risk addition to existing `RollingNormTimeSeriesDataset`
-  - Prevents the 194-billion loss spike with no architectural change
+- [x] **1.2 Clip y_scaled** — `torch.clamp(y_scaled, -5.0, 5.0)` added to `RollingNormTimeSeriesDataset`
+  - Also applied in `PercentileNormTimeSeriesDataset`
+
+- [x] **Leak fix** — `RollingNormTimeSeriesDataset` now uses only lookback stats for y (no future y_raw)
+
+- [x] **ZScore dataset** — `ZScoreNormTimeSeriesDataset` added — **FAILED** (RMSE=306, R²=-711): unbounded y_scaled when lookback std is tiny during calm periods; needs clamp
+- [ ] **ZScore + clip** — add `torch.clamp(y_scaled, -5, 5)` to `ZScoreNormTimeSeriesDataset` and retest
+
+- [x] **Gradient clipping** — `max_grad_norm` param added to `train_model_online`; pass e.g. `max_grad_norm=1.0`
 
 - [ ] **1.3 Log1p transform** — apply `torch.log1p` to H_bar before normalization, invert with `torch.expm1` after
   - Compresses flood spikes naturally — good for river data
@@ -47,10 +52,9 @@ Run each optimizer with the **best normalization from Phase 1**. Keep all other 
 - [ ] **2.3 SGD + Momentum + LR Schedule** — add `ReduceLROnPlateau` or cosine annealing
   - Decays LR when loss plateaus — helps after regime shifts
 
-- [ ] **2.4 FTRL** — via `river` library (`river.optim.FTRL`)
-  - Designed specifically for online learning — best theoretical fit
-  - Requires wrapping model updates manually (not a torch optimizer)
-  - Try on MLP only first (simpler architecture)
+- [x] **2.4 FTRL** — custom PyTorch `Optimizer` implemented in `cstm_models/ftrl.py`
+  - Full FTRL-Proximal (McMahan et al. 2013) — per-coordinate adaptive LR + L1/L2
+  - Exported via `cstm_models.FTRL`; tested in Phase 2b ablation loop alongside Adam
 
 - [ ] **2.5 Adam with lower LR + weight decay** — `torch.optim.Adam(lr=1e-4, weight_decay=1e-4)`
   - Regularization may help stability without changing optimizer family
@@ -92,7 +96,7 @@ Upgrade the amnesia strategy to be drift-aware rather than loss-spike-reactive.
 
 ## Priority Order
 
-```
+```text
 1.2 (clip y_scaled)  ← fastest win, try today
 1.1 (percentile norm)
 2.1 (RMSprop)
