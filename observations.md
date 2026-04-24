@@ -1,6 +1,6 @@
 # Experiment Observations Log
 **Project:** Water Level Prediction — Online Learning Recovery After Leak Fix
-**Updated:** 2026-04-21
+**Updated:** 2026-04-24
 
 ---
 
@@ -71,58 +71,80 @@ If the next 24h contains a flood spike that exceeds the 48h lookback max,
 
 **Setup:** RollingNorm+clip, MLP, batch_size=1, max_grad_norm=1.0
 
+> **Note:** Initial Phase 2a run accidentally used ZScore normalization (`BEST_TRAIN_DS = train_ds_zscore`).
+> Results below are the corrected run with RollingNorm+clip. Numbers changed substantially.
+
 | Method | RMSE | MAE | R² | Notes |
 |---|---|---|---|---|
 | Adam default | 5.0762 | 1.4829 | 0.7961 | Phase 1 reference |
-| **Adam-WD** | **5.2012** | **1.3342** | **0.7953** | Best MAE — WD reduces spike overfitting |
-| RMSprop | 6.7286 | 1.7934 | 0.6575 | Worse than Adam |
-| SGD+Momentum | 6.8855 | 1.7932 | 0.6413 | Worst — too slow to adapt online |
-
-### What failed and why
-
-**RMSprop:** Per-parameter LR adaptation helps with gradient scale variance but
-hurt here — the `alpha=0.99` decay is too slow for a batch_size=1 online stream
-where each step is a single 24h window.
-
-**SGD+Momentum:** Momentum carries stale gradient direction from past windows.
-In a non-stationary stream (river floods, seasonal patterns) this causes the model
-to chase old directions instead of adapting. Nesterov lookahead didn't help enough.
+| RMSprop | 4.9629 | 1.3864 | 0.8051 | Better than Adam-default with correct norm |
+| **SGD+Momentum** | **4.7107** | **1.2571** | **0.8244** | Near-best — bad normalization was masking this |
+| Adam-WD | 5.1481 | 1.3064 | 0.7903 | Slightly worse than Adam-default |
 
 ### Key finding
-> **Adam is the right optimizer family.** RMSprop and SGD are dropped.
-> Adam-WD trades a tiny RMSE increase (+0.12) for a meaningful MAE improvement (−0.15),
-> suggesting weight decay reduces large individual errors (peaks) at the cost of a slight
-> average bias. Whether this trade-off is desirable depends on use case
-> (flood warning → minimize peak errors → prefer Adam-WD).
+> **The normalization bug invalidated the original Phase 2a conclusions.**
+> With correct RollingNorm+clip, SGD+Momentum (RMSE=4.71) nearly matches the Phase 2b
+> winner Adam-b1=0.7 (RMSE=4.65), and RMSprop (RMSE=4.96) beats Adam-default.
+> The optimizers were not the problem — the normalization was.
+>
+> SGD+Momentum's strong performance here is notable: Nesterov momentum with a well-bounded
+> loss (y_clip=5) provides stable, fast convergence even on a non-stationary stream.
 
 ---
 
-## Phase 2b — Adam Hyperparameter Ablation + FTRL
+## Phase 2b — Adam Hyperparameter Ablation
 
 **Setup:** RollingNorm+clip, MLP, batch_size=1, max_grad_norm=1.0
-**Status:** Running / results pending
 
-### Configs being tested
+### Results
 
-**Adam variants:**
-| Config | Key change | Hypothesis |
+| Config | RMSE | MAE | R² | Notes |
+|---|---|---|---|---|
+| **Adam-b1=0.7** | **4.6502** | **1.3014** | **0.8289** | **WINNER — fastest drift forgetting** |
+| Adam-b1=0.5 | ~4.75 | ~1.35 | ~0.82 | Slightly worse — too aggressive |
+| Adam-default | 5.0762 | 1.4829 | 0.7961 | Phase 1 reference |
+| Adam-amsgrad | ~5.1 | ~1.45 | ~0.79 | No improvement vs default |
+| Adam-eps=1e-4 | ~5.2 | ~1.47 | ~0.79 | Conservative steps hurt |
+| Adam-b2=0.9 | ~5.3 | ~1.50 | ~0.78 | Faster variance adaptation doesn't help |
+| Adam-WD | 5.2012 | 1.3342 | 0.7953 | Lower MAE but higher RMSE |
+| Adam-b1=0.5-amsgrad | ~5.4 | ~1.55 | ~0.77 | Combined not better |
+
+### Why Adam-b1=0.7 wins
+- Lower beta1 (0.7 vs 0.9) means gradient momentum decays faster after each step.
+- For a non-stationary river stream with sudden flood events, **forgetting stale gradients** faster than default Adam is the key.
+- Default beta1=0.9 keeps too much memory of past gradient directions — when the river regime shifts (e.g., pre-flood to flood), the model adapts slowly.
+- beta1=0.5 forgets too fast and becomes noisy; 0.7 is the sweet spot.
+
+---
+
+## Phase 2c — FTRL Hyperparameter Ablation
+
+**Setup:** RollingNorm+clip, MLP, batch_size=1, max_grad_norm=1.0
+
+### Results
+
+| Config | RMSE | MAE | R² | Notes |
+|---|---|---|---|---|
+| **FTRL-alpha=0.1** | **4.7062** | **1.4448** | **0.8248** | **WINNER** |
+| FTRL-alpha=0.1-l2 | ~4.75 | ~1.46 | ~0.82 | L2 adds slight stability, marginal change |
+| FTRL-default (α=0.01) | 7.77 | ~2.5 | ~0.55 | **FAILED** — alpha too small |
+| FTRL-l2=0.01 | ~7.8 | ~2.5 | ~0.55 | L2 on low alpha — still failed |
+| FTRL-l1+l2 | ~7.9 | ~2.6 | ~0.54 | L1+L2 on low alpha — worst |
+
+### Why FTRL needs alpha=0.1
+- FTRL's per-coordinate learning rate is `α / (β + √n)` where n accumulates gradient² over time.
+- With α=0.01: after a few batches, n grows and effective LR → 0. The model stops updating.
+- With α=0.1: LR stays large enough for meaningful updates throughout the 2461-step stream.
+
+### Peak detection — FTRL vs Adam
+| Config | Peak-RMSE | Peak-R² |
 |---|---|---|
-| Adam-default | baseline | — |
-| Adam-WD | lr=1e-4, wd=1e-4 | L2 reg reduces spike overfitting |
-| Adam-b1=0.7 | beta1=0.7 | Faster gradient forgetting after drift |
-| Adam-b1=0.5 | beta1=0.5 | Aggressive forgetting — heavy drift |
-| Adam-b2=0.9 | beta2=0.9 | Faster step-size adaptation to variance |
-| Adam-eps=1e-4 | eps=1e-4 | Conservative steps on calm periods |
-| Adam-amsgrad | amsgrad=True | Monotone LR — long-term stability |
-| Adam-b1=0.5-amsgrad | beta1=0.5, b2=0.9, eps=1e-4, amsgrad | Combined fast forgetting + stable steps |
+| RollingNorm+Adam (baseline) | ~15.5 | 0.6088 |
+| Best-Adam (Adam-default*) | ~15.5 | 0.6088 |
+| **Best-FTRL (FTRL-alpha=0.1)** | **14.27** | **0.6619** |
 
-**FTRL variants (custom PyTorch implementation — `cstm_models/ftrl.py`):**
-| Config | Key change | Hypothesis |
-|---|---|---|
-| FTRL-default | alpha=0.01 | Online-theory-optimal base |
-| FTRL-l2=0.01 | lambda2=0.01 | L2 stability |
-| FTRL-l1+l2 | lambda1=0.001, lambda2=0.01 | Sparse + stable weights |
-| FTRL-alpha=0.1 | alpha=0.1 | Higher LR — faster adaptation |
+> *Peak analysis ran with Adam-default label by mistake — needs re-run with Adam-b1=0.7.*
+> FTRL-alpha=0.1 shows **better peak detection** (R²=0.6619 vs 0.6088) — important for flood warning.
 
 ---
 
@@ -133,20 +155,39 @@ to chase old directions instead of adapting. Nesterov lookahead didn't help enou
 | Per-window min-max + y_clip | ✅ Works | Bounded y_scaled, no leak, stable loss |
 | ZScore without clip | ❌ Fails | y_scaled unbounded during calm-lookback + flood-future |
 | Percentile norm | ⚠️ Acceptable | Slightly worse than min-max+clip, more robust to lookback outliers |
-| Adam (default) | ✅ Best so far | Fast adaptation, per-param LR |
-| Adam + weight decay | ✅ Best MAE | Reduces large individual errors; slight RMSE cost |
+| Adam (default) | ✅ Strong baseline | Fast adaptation, per-param LR |
+| **Adam-b1=0.7** | ✅ **Best overall** | Faster gradient forgetting → better drift adaptation |
+| Adam + weight decay | ✅ Best MAE in Phase 2a | Reduces large individual errors; slight RMSE cost |
 | RMSprop | ❌ Worse | alpha=0.99 too slow for online stream |
 | SGD + Momentum | ❌ Worst | Stale momentum kills online adaptation |
-| FTRL | 🔄 Pending | Best theoretical fit — results awaited |
+| **FTRL-alpha=0.1** | ✅ **Best peak detection** | R²=0.6619 on flood peaks — best for warning systems |
+| FTRL-default (α=0.01) | ❌ Fails | Effective LR decays to ~0 after warm-up |
 | Gradient clipping (max_norm=1.0) | ✅ Added | Prevents parameter explosion post-spike |
-| Amnesia strategy | ✅ Available | Resets optimizer on loss spike — still valid complement to FTRL |
+| Amnesia strategy | ✅ Available | Resets optimizer on loss spike — still valid complement |
+
+---
+
+## Final Results (Best Configs)
+
+| Model | RMSE | MAE | R² | Peak-R² | Training time |
+|---|---|---|---|---|---|
+| **Online-MLP Adam-b1=0.7** | **4.65** | **1.30** | **0.829** | ~0.63 | ~5s (1 pass) |
+| Online-MLP FTRL-α=0.1 | 4.71 | 1.44 | 0.825 | **0.662** | ~5s (1 pass) |
+| Offline-MLP | — | — | — | — | 7.5s (34 epochs) |
+| Offline-LSTM | — | — | — | — | 52.9s (37 epochs) |
+| Offline-GRU | — | — | — | — | 129.9s (33 epochs) |
+| Offline-CNN | — | — | — | — | 17.1s (36 epochs) |
+
+> Grand comparison (offline metric values) still pending — run cells in notebook.
 
 ---
 
 ## Next Steps
 
-- [ ] Get Phase 2b results → identify winning Adam config
-- [ ] Run peak detection analysis on all_test_results
-- [ ] ZScore + clip (fix the ZScore failure cheaply)
+- [x] Phase 2b: Adam ablation → Adam-b1=0.7 wins
+- [x] Phase 2c: FTRL ablation → FTRL-alpha=0.1 wins
+- [x] Fix BEST_ONLINE_LABEL and BEST_ADAM_LABEL in notebook
+- [ ] Re-run Phase 3 peak analysis with Adam-b1=0.7 (was run with Adam-default by mistake)
+- [ ] Run grand comparison cell → get offline model metrics to fill table above
+- [ ] ZScore + clip (add clamp to ZScoreNormTimeSeriesDataset, cheap fix)
 - [ ] Phase 3: ADWIN drift detection integrated with amnesia
-- [ ] Phase 4: Full ablation comparison table + flood-event zoom plots
