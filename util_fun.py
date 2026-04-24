@@ -194,7 +194,8 @@ def train_model_online(model, optimizer, criterion,
                        max_grad_norm=None,
                        use_amnesia_strategy=False, amnesia_threshold=2.5, amnesia_warmup_batches=10,
                        amnesia_new_lr=None,
-                       amnesia_reset_lr=None):
+                       amnesia_reset_lr=None,
+                       silent=False):
 
     # --- Setup from original function ---
     train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
@@ -206,10 +207,11 @@ def train_model_online(model, optimizer, criterion,
     running_avg_loss, ema_alpha = 0.0, 0.1
     amnesia_active = False # Flag to track if we're in a "spike" state
 
-    print(f"\nStarting 'online' training with {num_batches} batches...")
-    if use_amnesia_strategy:
-        print(f"  > Amnesia Strategy ENABLED (Threshold: {amnesia_threshold}x avg, "
-              f"Warmup: {amnesia_warmup_batches} batches)")
+    if not silent:
+        print(f"\nStarting 'online' training with {num_batches} batches...")
+        if use_amnesia_strategy:
+            print(f"  > Amnesia Strategy ENABLED (Threshold: {amnesia_threshold}x avg, "
+                  f"Warmup: {amnesia_warmup_batches} batches)")
     
     model.train()
     for i, (x_batch_scaled, y_batch_scaled, h_min, h_range) in enumerate(train_loader):
@@ -240,29 +242,26 @@ def train_model_online(model, optimizer, criterion,
                 
                 # --- TRIGGER AMNESIA ---
                 if current_loss > spike_threshold and not amnesia_active:
-                    amnesia_active = True # Set flag
-                    print(f"\n  *** AMNESIA TRIGGERED at batch {i+1} ***")
-                    print(f"      Loss {current_loss:.6f} > Threshold ({spike_threshold:.6f})")
-                    print(f"      Resetting optimizer state...")
-                    optimizer.state = defaultdict(dict) # Reset optimizer
-                    
-                    # --- NEW: Set new learning rate ---
+                    amnesia_active = True
+                    optimizer.state = defaultdict(dict)
+                    if not silent:
+                        print(f"\n  *** AMNESIA TRIGGERED at batch {i+1} ***")
+                        print(f"      Loss {current_loss:.6f} > Threshold ({spike_threshold:.6f})")
                     if amnesia_new_lr is not None:
-                        print(f"      Setting LR to {amnesia_new_lr}")
+                        if not silent:
+                            print(f"      Setting LR to {amnesia_new_lr}")
                         for param_group in optimizer.param_groups:
                             param_group['lr'] = amnesia_new_lr
-                    
-                    running_avg_loss = current_loss 
-                
+                    running_avg_loss = current_loss
+
                 # --- RESET AFTER SPIKE ---
                 elif current_loss < running_avg_loss and amnesia_active:
-                    amnesia_active = False # Clear flag
-                    print(f"  *** AMNESIA RESET at batch {i+1} ***")
-                    print(f"      Loss {current_loss:.6f} is back below average.")
-                    
-                    # --- NEW: Reset to original learning rate ---
+                    amnesia_active = False
+                    if not silent:
+                        print(f"  *** AMNESIA RESET at batch {i+1}, Loss {current_loss:.6f}")
                     if amnesia_reset_lr is not None:
-                        print(f"      Resetting LR to {amnesia_reset_lr}")
+                        if not silent:
+                            print(f"      Resetting LR to {amnesia_reset_lr}")
                         for param_group in optimizer.param_groups:
                             param_group['lr'] = amnesia_reset_lr
         
@@ -273,11 +272,12 @@ def train_model_online(model, optimizer, criterion,
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
         optimizer.step()
         
-        if (i+1) % 100 == 0:
+        if not silent and (i+1) % 100 == 0:
             print(f"   Batch {i+1}/{num_batches}, Loss: {current_loss:.6f}")
-            
-    print(f"   Batch {num_batches}/{num_batches}, Loss: {current_loss:.6f}")
-    print("Training complete.")
+
+    if not silent:
+        print(f"   Batch {num_batches}/{num_batches}, Loss: {current_loss:.6f}")
+        print("Training complete.")
     
     # Final cleanup: ensure LR is back to original if amnesia is still active
     if amnesia_active and amnesia_reset_lr is not None:
