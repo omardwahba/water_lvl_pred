@@ -25,26 +25,64 @@ import itertools
 
 EPSILON = 1e-6  # For numerical stability in normalization
 
-# window normalization 
+# window normalization
 class RollingNormTimeSeriesDataset(Dataset):
     """
-    A PyTorch Dataset that applies windowed normalization for each sample.
-    For each (X, y) sample, it normalizes both X and y using the
-    min/max statistics calculated *only* from the X (48h lookback) window.
-    AND MIN/MAX for y normalization is computed using both the lookback X window
-    and the future y window, to avoid data leakage.
+    Per-window min-max normalization. Stats come *only* from the lookback X window —
+    no future y values used (leak fix). y_scaled is clamped to [-y_clip, y_clip] to
+    prevent explosive loss when a flood spike exceeds the lookback range.
+
     Args:
-        X_seq (numpy arr or list): Input sequences of shape (num_samples, lookback, num_features).
-        y_seq (numpy arr or list): Output sequences of shape (num_samples, horizon).
-        h_bar_index (int): Index of the H_bar feature in the data.
-        epsilon (float): Small constant for numerical stability.
-    Returns:
-        tuple: (x_scaled, y_scaled, h_bar_min, h_bar_range) for each sample.
-    1. x_scaled: Normalized input sequence.
-    2. y_scaled: Normalized output sequence.
-    3. h_bar_min: Minimum value used for y normalization.
-    4. h_bar_range: Range (max-min) used for y normalization.
-    5. These last two are needed to unscale predictions later.
+        X_seq: shape (num_samples, lookback, num_features)
+        y_seq: shape (num_samples, horizon)
+        h_bar_index: column index of H_bar in X
+        epsilon: division stability constant
+        y_clip: symmetric clamp bound on y_scaled (default 5.0)
+    Returns (per sample):
+        x_scaled, y_scaled, h_bar_min, h_bar_range
+    Unscale: y_true = y_scaled * h_bar_range + h_bar_min
+    """
+    def __init__(self, X_seq, y_seq, h_bar_index, epsilon=EPSILON, y_clip=5.0):
+        self.X_seq = torch.tensor(X_seq, dtype=torch.float32)
+        self.y_seq = torch.tensor(y_seq, dtype=torch.float32)
+        self.h_bar_index = h_bar_index
+        self.epsilon = epsilon
+        self.y_clip = y_clip
+
+    def __len__(self):
+        return len(self.X_seq)
+
+    def __getitem__(self, idx):
+        x_raw = self.X_seq[idx]  # (lookback, n_features)
+        y_raw = self.y_seq[idx]  # (horizon,)
+
+        min_vals, _ = torch.min(x_raw, dim=0)
+        max_vals, _ = torch.max(x_raw, dim=0)
+        range_vals = max_vals - min_vals + self.epsilon
+        x_scaled = (x_raw - min_vals) / range_vals
+
+        # Lookback-only stats for y — no future leakage
+        h_bar_min = min_vals[self.h_bar_index]
+        h_bar_range = range_vals[self.h_bar_index]
+        y_scaled = (y_raw - h_bar_min) / h_bar_range
+        # Clamp: prevents loss explosion when future exceeds lookback range (e.g. flood events)
+        y_scaled = torch.clamp(y_scaled, -self.y_clip, self.y_clip)
+
+        return x_scaled, y_scaled, h_bar_min, h_bar_range
+
+
+class ZScoreNormTimeSeriesDataset(Dataset):
+    """
+    Per-window z-score normalization. Mean and std come only from the lookback window.
+
+    Why z-score over min-max for online learning:
+    - Min-max maps the lookback to [0,1], so future values outside that range produce
+      unbounded scaled targets (e.g. y_scaled = 10 during a flood).
+    - Z-score centers on 0 with unit variance — a future spike is only a few stds away,
+      keeping y_scaled in a stable range without hard clipping.
+
+    Returns same 4-tuple interface as RollingNormTimeSeriesDataset.
+    Unscale: y_true = y_scaled * h_bar_std + h_bar_mean
     """
     def __init__(self, X_seq, y_seq, h_bar_index, epsilon=EPSILON):
         self.X_seq = torch.tensor(X_seq, dtype=torch.float32)
@@ -56,46 +94,84 @@ class RollingNormTimeSeriesDataset(Dataset):
         return len(self.X_seq)
 
     def __getitem__(self, idx):
-        x_raw = self.X_seq[idx]  # Shape: (48, 4)
-        y_raw = self.y_seq[idx]  # Shape: (24,)
-        
-        # 1. Get stats from the 48h lookback window (x_raw)
-        # min/max per feature, shape (4,)
-        min_vals, _ = torch.min(x_raw, dim=0) 
-        max_vals, _ = torch.max(x_raw, dim=0)
-        # Add epsilon for stability (to avoid division by zero if max==min)
+        x_raw = self.X_seq[idx]  # (lookback, n_features)
+        y_raw = self.y_seq[idx]  # (horizon,)
+
+        mean_vals = torch.mean(x_raw, dim=0)
+        std_vals  = torch.std(x_raw, dim=0) + self.epsilon
+        x_scaled = (x_raw - mean_vals) / std_vals
+
+        h_bar_mean = mean_vals[self.h_bar_index]
+        h_bar_std  = std_vals[self.h_bar_index]
+        y_scaled = (y_raw - h_bar_mean) / h_bar_std
+
+        return x_scaled, y_scaled, h_bar_mean, h_bar_std
+
+
+class PercentileNormTimeSeriesDataset(Dataset):
+    """
+    Per-window percentile-based min-max normalization (Plan 1.1).
+    Uses [low_q, high_q] quantiles of the lookback instead of strict min/max,
+    so a single outlier in the 48h window can't collapse the normalization range.
+    y_scaled is clamped to [-y_clip, y_clip].
+
+    Args:
+        low_q / high_q: quantile bounds (default 0.05 / 0.95)
+        y_clip: symmetric clamp bound on y_scaled (default 5.0)
+    Returns same 4-tuple interface as RollingNormTimeSeriesDataset.
+    """
+    def __init__(self, X_seq, y_seq, h_bar_index, epsilon=EPSILON,
+                 low_q=0.05, high_q=0.95, y_clip=5.0):
+        self.X_seq = torch.tensor(X_seq, dtype=torch.float32)
+        self.y_seq = torch.tensor(y_seq, dtype=torch.float32)
+        self.h_bar_index = h_bar_index
+        self.epsilon = epsilon
+        self.low_q = low_q
+        self.high_q = high_q
+        self.y_clip = y_clip
+
+    def __len__(self):
+        return len(self.X_seq)
+
+    def __getitem__(self, idx):
+        x_raw = self.X_seq[idx]  # (lookback, n_features)
+        y_raw = self.y_seq[idx]  # (horizon,)
+
+        min_vals = torch.quantile(x_raw, self.low_q, dim=0)
+        max_vals = torch.quantile(x_raw, self.high_q, dim=0)
         range_vals = max_vals - min_vals + self.epsilon
         x_scaled = (x_raw - min_vals) / range_vals
-        
-        # 3. Compute H_bar stats using both the lookback X window and the future y window
-        #    so min/max for H_bar considers values from both x_raw[:, h_bar_index] and y_raw.
-        y_min = torch.min(y_raw)
-        y_max = torch.max(y_raw)
 
-        h_bar_min = torch.min(min_vals[self.h_bar_index], y_min)
-        h_bar_max = torch.max(max_vals[self.h_bar_index], y_max)
-        h_bar_range = h_bar_max - h_bar_min + self.epsilon
+        h_bar_min = min_vals[self.h_bar_index]
+        h_bar_range = range_vals[self.h_bar_index]
         y_scaled = (y_raw - h_bar_min) / h_bar_range
+        y_scaled = torch.clamp(y_scaled, -self.y_clip, self.y_clip)
 
-        # Return everything needed for training and unscaling
         return x_scaled, y_scaled, h_bar_min, h_bar_range
-    
-def create_sequences(data, lookback, horizon, target_value_index):
+
+
+def create_sequences(data, lookback, horizon, target_value_index, step = None):
     ''' Create input-output sequences using sliding window approach.
     Args:
         data (np.array): The raw data array.
         lookback (int): Number of past time steps to use as input.
         horizon (int): Number of future time steps to predict.
         h_bar_index (int): Index of the H_bar feature in the data.
+        step (int or None): step size for sliding window(the timestamps):
+            - None/horizon: the original behavior - y[n] appears in X[n+1] --> the leakage
+            - lookback+ horizon : no overlap between X and y windows, but more samples (under test).
     Returns:
         X (np.array): Input sequences of shape (num_samples, lookback, num_features).
         y (np.array): Output sequences of shape (num_samples, horizon).
     '''
+    if step is None:
+        step = horizon
+
     X, y = [], []
     print("Creating sequences...")
-    print(f"Data length: {len(data)}, lookback: {lookback}, horizon: {horizon}")
+    print(f"Data length: {len(data)}, lookback: {lookback}, horizon: {horizon} , step: {step}")
     
-    for i in range(0, len(data), horizon):
+    for i in range(0, len(data), step):
         
         historical_data = data[i:(i + lookback), :]
         future_y = data[(i + lookback):(i + lookback + horizon), target_value_index]
@@ -115,9 +191,11 @@ def create_sequences(data, lookback, horizon, target_value_index):
 def train_model_online(model, optimizer, criterion,
                        dataset, df,
                        LOOKBACK, HORIZON, batch_size,
+                       max_grad_norm=None,
                        use_amnesia_strategy=False, amnesia_threshold=2.5, amnesia_warmup_batches=10,
-                       amnesia_new_lr=None,   # <-- NEW: LR to set *during* a spike
-                       amnesia_reset_lr=None): # <-- NEW: The original LR to return to
+                       amnesia_new_lr=None,
+                       amnesia_reset_lr=None,
+                       silent=False):
 
     # --- Setup from original function ---
     train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
@@ -129,10 +207,11 @@ def train_model_online(model, optimizer, criterion,
     running_avg_loss, ema_alpha = 0.0, 0.1
     amnesia_active = False # Flag to track if we're in a "spike" state
 
-    print(f"\nStarting 'online' training with {num_batches} batches...")
-    if use_amnesia_strategy:
-        print(f"  > Amnesia Strategy ENABLED (Threshold: {amnesia_threshold}x avg, "
-              f"Warmup: {amnesia_warmup_batches} batches)")
+    if not silent:
+        print(f"\nStarting 'online' training with {num_batches} batches...")
+        if use_amnesia_strategy:
+            print(f"  > Amnesia Strategy ENABLED (Threshold: {amnesia_threshold}x avg, "
+                  f"Warmup: {amnesia_warmup_batches} batches)")
     
     model.train()
     for i, (x_batch_scaled, y_batch_scaled, h_min, h_range) in enumerate(train_loader):
@@ -163,42 +242,42 @@ def train_model_online(model, optimizer, criterion,
                 
                 # --- TRIGGER AMNESIA ---
                 if current_loss > spike_threshold and not amnesia_active:
-                    amnesia_active = True # Set flag
-                    print(f"\n  *** AMNESIA TRIGGERED at batch {i+1} ***")
-                    print(f"      Loss {current_loss:.6f} > Threshold ({spike_threshold:.6f})")
-                    print(f"      Resetting optimizer state...")
-                    optimizer.state = defaultdict(dict) # Reset optimizer
-                    
-                    # --- NEW: Set new learning rate ---
+                    amnesia_active = True
+                    optimizer.state = defaultdict(dict)
+                    if not silent:
+                        print(f"\n  *** AMNESIA TRIGGERED at batch {i+1} ***")
+                        print(f"      Loss {current_loss:.6f} > Threshold ({spike_threshold:.6f})")
                     if amnesia_new_lr is not None:
-                        print(f"      Setting LR to {amnesia_new_lr}")
+                        if not silent:
+                            print(f"      Setting LR to {amnesia_new_lr}")
                         for param_group in optimizer.param_groups:
                             param_group['lr'] = amnesia_new_lr
-                    
-                    running_avg_loss = current_loss 
-                
+                    running_avg_loss = current_loss
+
                 # --- RESET AFTER SPIKE ---
                 elif current_loss < running_avg_loss and amnesia_active:
-                    amnesia_active = False # Clear flag
-                    print(f"  *** AMNESIA RESET at batch {i+1} ***")
-                    print(f"      Loss {current_loss:.6f} is back below average.")
-                    
-                    # --- NEW: Reset to original learning rate ---
+                    amnesia_active = False
+                    if not silent:
+                        print(f"  *** AMNESIA RESET at batch {i+1}, Loss {current_loss:.6f}")
                     if amnesia_reset_lr is not None:
-                        print(f"      Resetting LR to {amnesia_reset_lr}")
+                        if not silent:
+                            print(f"      Resetting LR to {amnesia_reset_lr}")
                         for param_group in optimizer.param_groups:
                             param_group['lr'] = amnesia_reset_lr
         
         # 3. Backward pass and optimize (Original)
         optimizer.zero_grad()
         loss.backward()
+        if max_grad_norm is not None:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
         optimizer.step()
         
-        if (i+1) % 100 == 0:
+        if not silent and (i+1) % 100 == 0:
             print(f"   Batch {i+1}/{num_batches}, Loss: {current_loss:.6f}")
-            
-    print(f"   Batch {num_batches}/{num_batches}, Loss: {current_loss:.6f}")
-    print("Training complete.")
+
+    if not silent:
+        print(f"   Batch {num_batches}/{num_batches}, Loss: {current_loss:.6f}")
+        print("Training complete.")
     
     # Final cleanup: ensure LR is back to original if amnesia is still active
     if amnesia_active and amnesia_reset_lr is not None:
@@ -467,6 +546,7 @@ def calculate_metrics_and_plot(result_dict, plot_title, plotly_theme='simple_whi
     if export_html:
         if export_file_name is None:
             raise ValueError("export_file_name must be provided when export_html is True.")
+        os.makedirs(os.path.dirname(export_file_name) or '.', exist_ok=True)
         fig_base.write_html(f"{export_file_name}.html")
 
     # --- Save a static PNG using seaborn or matplotlib ---
@@ -480,13 +560,14 @@ def calculate_metrics_and_plot(result_dict, plot_title, plotly_theme='simple_whi
         target_dir = '.'
 
     png_path = os.path.join(target_dir, base_name + '.png')
+    os.makedirs(target_dir, exist_ok=True)
 
     try:
         if use_seaborn_plot:
             # Use seaborn lineplot for better-looking plots
             plt.figure(figsize=(12, 5))
             sns.set_style("darkgrid")
-            sns.lineplot(data=df_plot_data, x='Timestamp', y='H_bar Value', hue='Legend', linewidth=2, errorbar=None)
+            sns.lineplot(data=df_plot_data, x='Timestamp', y='H_bar Value', hue='Legend', style='Legend', palette='tab20', linewidth=2, errorbar=None)
             plt.title(plot_title, fontsize=14)
             plt.xlabel('Timestamp', fontsize=12)
             plt.ylabel('H̅ (Water Level)', fontsize=12)
@@ -524,6 +605,7 @@ def calculate_metrics_and_plot(result_dict, plot_title, plotly_theme='simple_whi
 
         if export_file_name is None:
             raise ValueError("export_file_name must be provided when export_metrics is True.")
+        os.makedirs(target_dir, exist_ok=True)
         csv_path = os.path.join(target_dir, base_name + '.csv')
         # Use the already-computed metrics_dict rather than recalculating
         rows = []
@@ -542,6 +624,115 @@ def calculate_metrics_and_plot(result_dict, plot_title, plotly_theme='simple_whi
             print(f"Appended metrics to CSV: {csv_path}")
         except Exception as e:
             print(f"Warning: could not write metrics CSV to {csv_path}: {e}")
+
+
+def peak_analysis(result_dict, peak_quantile=0.90, n_peaks=5, window_hours=72,
+                  export_file_name=None):
+    """
+    Peak-aware evaluation: computes metrics restricted to flood-peak timesteps
+    and renders zoomed plots around the top-N peaks.
+
+    Args:
+        result_dict:    same dict as calculate_metrics_and_plot — {name: (y_true, y_pred, timestamps)}
+        peak_quantile:  threshold quantile on y_true to define a "peak" timestep (default 0.90)
+        n_peaks:        number of top peaks to zoom into (default 5)
+        window_hours:   hours on each side of a peak to include in the zoom plot (default 72)
+        export_file_name: base path for PNG/CSV export (optional)
+    """
+    # Use the first entry's y_true as reference for peak threshold
+    ref_name   = next(iter(result_dict))
+    y_true_ref, _, ts_ref = result_dict[ref_name]
+    ts_ref = pd.to_datetime(ts_ref)
+
+    threshold = np.quantile(y_true_ref, peak_quantile)
+    print(f"Peak threshold ({int(peak_quantile*100)}th pct): {threshold:.4f}")
+
+    # ── Per-method peak metrics ───────────────────────────────────────────────
+    print(f"\n{'Method':<25} {'Peak-RMSE':>10} {'Peak-MAE':>10} {'Peak-R²':>8}")
+    print("-" * 57)
+    peak_metrics = {}
+    for name, (y_true, y_pred, ts) in result_dict.items():
+        mask = y_true >= threshold
+        if mask.sum() == 0:
+            continue
+        p_rmse = root_mean_squared_error(y_true[mask], y_pred[mask])
+        p_mae  = mean_absolute_error(y_true[mask], y_pred[mask])
+        p_r2   = r2_score(y_true[mask], y_pred[mask])
+        peak_metrics[name] = (p_rmse, p_mae, p_r2)
+        print(f"{name:<25} {p_rmse:>10.4f} {p_mae:>10.4f} {p_r2:>8.4f}")
+
+    # Export peak metrics CSV
+    if export_file_name is not None:
+        os.makedirs(os.path.dirname(export_file_name) or '.', exist_ok=True)
+        rows = [{'method': n, 'peak_rmse': r, 'peak_mae': m, 'peak_r2': r2,
+                 'peak_quantile': peak_quantile}
+                for n, (r, m, r2) in peak_metrics.items()]
+        pd.DataFrame(rows).to_csv(f"{export_file_name}_peak_metrics.csv", index=False)
+        print(f"\nSaved peak metrics: {export_file_name}_peak_metrics.csv")
+
+    # ── Find top-N peaks in reference y_true ─────────────────────────────────
+    peak_mask  = y_true_ref >= threshold
+    peak_vals  = y_true_ref[peak_mask]
+    peak_ts    = ts_ref[peak_mask]
+
+    # Group nearby peaks — take the maximum within each contiguous block
+    df_peaks = pd.DataFrame({'val': peak_vals, 'ts': peak_ts}).sort_values('ts')
+    df_peaks['gap'] = df_peaks['ts'].diff() > pd.Timedelta(hours=window_hours)
+    df_peaks['group'] = df_peaks['gap'].cumsum()
+    top_peaks = (df_peaks.groupby('group')
+                          .apply(lambda g: g.loc[g['val'].idxmax()])
+                          .nlargest(n_peaks, 'val'))
+
+    print(f"\nTop-{n_peaks} peaks:")
+    for _, row in top_peaks.iterrows():
+        print(f"  {row['ts']}  H_bar={row['val']:.4f}")
+
+    # ── Zoom plots around each peak ───────────────────────────────────────────
+    delta = pd.Timedelta(hours=window_hours)
+    n_methods = len(result_dict)
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
+              '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf',
+              '#aec7e8', '#ffbb78']
+
+    for peak_idx, (_, peak_row) in enumerate(top_peaks.iterrows()):
+        center = peak_row['ts']
+        t0, t1 = center - delta, center + delta
+
+        fig, ax = plt.subplots(figsize=(14, 5))
+        ax.set_title(f"Peak #{peak_idx+1}  |  {center.date()}  |  H_bar={peak_row['val']:.2f}",
+                     fontsize=13)
+
+        # Plot ground truth once (from reference)
+        ref_y_true, _, ref_ts = result_dict[ref_name]
+        ref_ts_pd = pd.to_datetime(ref_ts)
+        win = (ref_ts_pd >= t0) & (ref_ts_pd <= t1)
+        ax.plot(ref_ts_pd[win], ref_y_true[win],
+                color='black', linewidth=2.5, label='True', zorder=10)
+
+        # Plot each method's prediction
+        for i, (name, (y_true, y_pred, ts)) in enumerate(result_dict.items()):
+            ts_pd = pd.to_datetime(ts)
+            win   = (ts_pd >= t0) & (ts_pd <= t1)
+            ax.plot(ts_pd[win], y_pred[win],
+                    color=colors[i % len(colors)], linewidth=1.4,
+                    linestyle='--', alpha=0.85, label=name)
+
+        # Mark the peak
+        ax.axvline(center, color='red', linestyle=':', linewidth=1.2, alpha=0.6)
+        ax.axhline(threshold, color='grey', linestyle=':', linewidth=1, alpha=0.5,
+                   label=f'threshold ({int(peak_quantile*100)}th pct)')
+
+        ax.set_xlabel('Timestamp')
+        ax.set_ylabel('H̅ (Water Level)')
+        ax.legend(fontsize=8, ncol=2)
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+
+        if export_file_name is not None:
+            path = f"{export_file_name}_peak{peak_idx+1}.png"
+            plt.savefig(path, dpi=150)
+            print(f"Saved: {path}")
+        plt.show()
 
 
 def export_results_to_csv(result_dict, export_file_name):
