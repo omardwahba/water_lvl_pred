@@ -28,19 +28,25 @@ EPSILON = 1e-6  # For numerical stability in normalization
 # window normalization
 class RollingNormTimeSeriesDataset(Dataset):
     """
-    Per-window min-max normalization. Stats come *only* from the lookback X window —
-    no future y values used (leak fix). y_scaled is clamped to [-y_clip, y_clip] to
-    prevent explosive loss when a flood spike exceeds the lookback range.
+    Per-window normalization with last-value centering for H_bar.
 
-    Args:
-        X_seq: shape (num_samples, lookback, num_features)
-        y_seq: shape (num_samples, horizon)
-        h_bar_index: column index of H_bar in X
-        epsilon: division stability constant
-        y_clip: symmetric clamp bound on y_scaled (default 5.0)
+    All features in X: per-feature min-max within the lookback window.
+    H_bar in X and y: centered on the LAST observed H_bar value (H_bar[lookback_end]),
+    scaled by the lookback std.
+
+    Why last-value centering instead of min:
+    - Using h_bar_min as zero-point anchors predictions to the lowest recent level.
+      When a flood arrives the lookback is still calm → predictions are systematically
+      shifted downward (model predicts "within lookback range" which is too low).
+    - h_bar_last = H_bar[lookback_end] is always the current observed level, so
+      y_scaled ≈ 0 means "stays at current level" and y_scaled > 0 means "rises".
+      The model learns a centered, physically meaningful target regardless of absolute level.
+
+    No data leakage: h_bar_ref and h_bar_scale both come only from the lookback X.
+
     Returns (per sample):
-        x_scaled, y_scaled, h_bar_min, h_bar_range
-    Unscale: y_true = y_scaled * h_bar_range + h_bar_min
+        x_scaled, y_scaled, h_bar_ref, h_bar_scale
+    Unscale: y_true = y_scaled * h_bar_scale + h_bar_ref
     """
     def __init__(self, X_seq, y_seq, h_bar_index, epsilon=EPSILON, y_clip=5.0):
         self.X_seq = torch.tensor(X_seq, dtype=torch.float32)
@@ -56,19 +62,22 @@ class RollingNormTimeSeriesDataset(Dataset):
         x_raw = self.X_seq[idx]  # (lookback, n_features)
         y_raw = self.y_seq[idx]  # (horizon,)
 
+        # Min-max normalize all features from lookback (no leakage)
         min_vals, _ = torch.min(x_raw, dim=0)
         max_vals, _ = torch.max(x_raw, dim=0)
         range_vals = max_vals - min_vals + self.epsilon
         x_scaled = (x_raw - min_vals) / range_vals
 
-        # Lookback-only stats for y — no future leakage
-        h_bar_min = min_vals[self.h_bar_index]
-        h_bar_range = range_vals[self.h_bar_index]
-        y_scaled = (y_raw - h_bar_min) / h_bar_range
-        # Clamp: prevents loss explosion when future exceeds lookback range (e.g. flood events)
+        # H_bar: last-value reference + lookback std scale (no leakage)
+        h_bar_lookback = x_raw[:, self.h_bar_index]
+        h_bar_ref   = h_bar_lookback[-1]                     # current observed level
+        h_bar_scale = h_bar_lookback.std() + self.epsilon    # lookback variability
+
+        x_scaled[:, self.h_bar_index] = (h_bar_lookback - h_bar_ref) / h_bar_scale
+        y_scaled = (y_raw - h_bar_ref) / h_bar_scale
         y_scaled = torch.clamp(y_scaled, -self.y_clip, self.y_clip)
 
-        return x_scaled, y_scaled, h_bar_min, h_bar_range
+        return x_scaled, y_scaled, h_bar_ref, h_bar_scale
 
 
 class ZScoreNormTimeSeriesDataset(Dataset):
@@ -730,6 +739,261 @@ def peak_analysis(result_dict, peak_quantile=0.90, n_peaks=5, window_hours=72,
 
         if export_file_name is not None:
             path = f"{export_file_name}_peak{peak_idx+1}.png"
+            plt.savefig(path, dpi=150)
+            print(f"Saved: {path}")
+        plt.show()
+
+
+def threshold_sweep_analysis(result_dict, n_thresholds=50,
+                             quantile_range=(0.50, 0.99),
+                             key_quantiles=(0.50, 0.75, 0.90, 0.95, 0.99),
+                             min_samples=10,
+                             export_file_name=None):
+    """
+    Threshold sweep: how does prediction quality change as we focus on increasingly
+    extreme flood events?
+
+    For each of N thresholds spanning the quantile_range:
+      - Regression metrics (Bias, MAE, RMSE, R², Rel.Bias%) on y_true >= threshold
+      - Classification metrics (Hit-Rate, False-Alarm) for predicting "is this a peak?"
+
+    Outputs:
+      - 6-panel plot — each metric vs threshold, one line per method
+      - CSV table — full sweep [method, quantile, h_bar_threshold, N, ...metrics]
+      - Console summary at key_quantiles (default 50/75/90/95/99)
+
+    Args:
+        result_dict:    {name: (y_true, y_pred, timestamps)}
+        n_thresholds:   number of sweep points (default 50)
+        quantile_range: (low, high) quantile bounds (default 0.50–0.99)
+        key_quantiles:  quantiles to print in console summary table
+        min_samples:    skip metric computation if N below this (default 10)
+        export_file_name: base path for PNG/CSV export
+    """
+    # Use first entry as reference for threshold values (consistent across methods)
+    ref_name = next(iter(result_dict))
+    y_true_ref, _, _ = result_dict[ref_name]
+    y_true_ref = np.array(y_true_ref)
+
+    # Generate threshold quantiles and corresponding H_bar values
+    sweep_qs = np.linspace(quantile_range[0], quantile_range[1], n_thresholds)
+    sweep_thresholds = np.quantile(y_true_ref, sweep_qs)
+
+    # Build full sweep table
+    rows = []
+    for name, (y_true, y_pred, _) in result_dict.items():
+        y_true = np.array(y_true)
+        y_pred = np.array(y_pred)
+
+        for q, thr in zip(sweep_qs, sweep_thresholds):
+            mask_true  = y_true >= thr
+            mask_pred  = y_pred >= thr
+            n_peaks    = int(mask_true.sum())
+
+            # Classification (always computable)
+            tp = int((mask_true & mask_pred).sum())
+            fn = int((mask_true & ~mask_pred).sum())
+            fp = int((~mask_true & mask_pred).sum())
+            tn = int((~mask_true & ~mask_pred).sum())
+            hit_rate    = tp / (tp + fn) if (tp + fn) > 0 else np.nan
+            false_alarm = fp / (fp + tn) if (fp + tn) > 0 else np.nan
+            precision   = tp / (tp + fp) if (tp + fp) > 0 else np.nan
+
+            # Regression on peak subset
+            if n_peaks >= min_samples:
+                bias = float((y_pred[mask_true] - y_true[mask_true]).mean())
+                mae  = mean_absolute_error(y_true[mask_true], y_pred[mask_true])
+                rmse = root_mean_squared_error(y_true[mask_true], y_pred[mask_true])
+                # R² only meaningful if there's variance in the subset
+                if y_true[mask_true].std() > 1e-6 and n_peaks >= 30:
+                    r2 = r2_score(y_true[mask_true], y_pred[mask_true])
+                else:
+                    r2 = np.nan
+                rel_bias = bias / max(y_true[mask_true].mean(), 1e-6) * 100
+            else:
+                bias = mae = rmse = r2 = rel_bias = np.nan
+
+            rows.append({
+                'method':         name,
+                'quantile':       q,
+                'h_bar_threshold': thr,
+                'N':              n_peaks,
+                'Bias':           bias,
+                'MAE':            mae,
+                'RMSE':           rmse,
+                'R2':             r2,
+                'Rel_Bias_pct':   rel_bias,
+                'Hit_Rate':       hit_rate,
+                'False_Alarm':    false_alarm,
+                'Precision':      precision,
+            })
+
+    df_sweep = pd.DataFrame(rows)
+
+    # ── Console summary at key quantiles ────────────────────────────────────────
+    print(f"\n{'='*100}")
+    print(f"Threshold Sweep Summary — Key Quantiles")
+    print(f"{'='*100}")
+    for q in key_quantiles:
+        thr_q = np.quantile(y_true_ref, q)
+        n_peaks = int((y_true_ref >= thr_q).sum())
+        print(f"\nQuantile {q:.2f}  |  H_bar ≥ {thr_q:.2f}  |  N={n_peaks} peak timesteps")
+        print(f"{'Method':<28} {'Bias':>8} {'MAE':>8} {'RMSE':>8} {'R²':>6} "
+              f"{'Hit-Rate':>9} {'FA-Rate':>8}")
+        print("-" * 88)
+        # Find the closest sweep point to this key quantile
+        for name in result_dict:
+            sub = df_sweep[(df_sweep['method'] == name) &
+                           (np.isclose(df_sweep['quantile'],
+                                       df_sweep['quantile'].iloc[(df_sweep['quantile']-q).abs().argmin()]))]
+            if sub.empty:
+                continue
+            r = sub.iloc[0]
+            r2_str = f"{r['R2']:.3f}" if not np.isnan(r['R2']) else "  n/a"
+            print(f"{name:<28} {r['Bias']:>+8.2f} {r['MAE']:>8.2f} {r['RMSE']:>8.2f} "
+                  f"{r2_str:>6} {r['Hit_Rate']:>9.2%} {r['False_Alarm']:>8.2%}")
+
+    # ── CSV export ──────────────────────────────────────────────────────────────
+    if export_file_name is not None:
+        os.makedirs(os.path.dirname(export_file_name) or '.', exist_ok=True)
+        csv_path = f"{export_file_name}_threshold_sweep.csv"
+        df_sweep.to_csv(csv_path, index=False)
+        print(f"\nSaved full sweep table: {csv_path}")
+
+    # ── 6-panel plot ────────────────────────────────────────────────────────────
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
+              '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
+
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig.suptitle('Threshold Sweep — Performance vs Peak Severity', fontsize=14)
+
+    panels = [
+        ('RMSE',        'RMSE',         'lower is better'),
+        ('MAE',         'MAE',          'lower is better'),
+        ('Bias',        'Bias (pred − true)', 'closer to 0 is better'),
+        ('R2',          'R²',           'higher is better'),
+        ('Hit_Rate',    'Hit Rate (recall)', 'higher is better'),
+        ('False_Alarm', 'False Alarm Rate', 'lower is better'),
+    ]
+
+    for ax, (col, ylabel, hint) in zip(axes.flat, panels):
+        for i, name in enumerate(result_dict):
+            sub = df_sweep[df_sweep['method'] == name]
+            ax.plot(sub['h_bar_threshold'], sub[col],
+                    color=colors[i % len(colors)],
+                    linewidth=2, label=name, marker='.', markersize=4)
+        if col == 'Bias':
+            ax.axhline(0, color='black', linestyle=':', linewidth=1, alpha=0.5)
+        ax.set_xlabel('H̅ threshold')
+        ax.set_ylabel(ylabel)
+        ax.set_title(f'{ylabel}  —  {hint}', fontsize=11)
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=7, loc='best')
+
+    plt.tight_layout()
+    if export_file_name is not None:
+        path = f"{export_file_name}_threshold_sweep.png"
+        plt.savefig(path, dpi=150)
+        print(f"Saved plot: {path}")
+    plt.show()
+
+    return df_sweep
+
+
+def diagnostic_plot(result_dict, h_bar_quantiles=(0.5, 0.75, 0.90, 0.95),
+                    export_file_name=None):
+    """
+    Bias analysis plots for each method in result_dict.
+
+    Panel 1 — Scatter (y_true vs y_pred) with 1:1 reference line.
+              Colour-codes points by H_bar level (calm / moderate / high / peak).
+    Panel 2 — Residual (y_pred − y_true) vs y_true level.
+              Horizontal red line at 0; running mean overlaid.
+    Panel 3 — Bias statistics table by H_bar quantile band.
+
+    No leakage — uses only the already-generated predictions.
+    """
+    n_methods = len(result_dict)
+    quantile_labels = [f"<{int(q*100)}th" for q in h_bar_quantiles]
+
+    for name, (y_true, y_pred, _) in result_dict.items():
+        y_true = np.array(y_true)
+        y_pred = np.array(y_pred)
+        residual = y_pred - y_true
+
+        # Quantile bands for colouring
+        thresholds = np.quantile(y_true, h_bar_quantiles)
+        bands = np.zeros(len(y_true), dtype=int)
+        for i, thr in enumerate(thresholds):
+            bands[y_true >= thr] = i + 1
+        band_labels = ['calm'] + [f'≥{int(q*100)}th' for q in h_bar_quantiles]
+        colors_band = ['#1f77b4', '#2ca02c', '#ff7f0e', '#d62728', '#9467bd']
+
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+        fig.suptitle(f"Bias Analysis — {name}", fontsize=13)
+
+        # --- Panel 1: Scatter y_true vs y_pred ---
+        ax = axes[0]
+        for b, (label, col) in enumerate(zip(band_labels, colors_band)):
+            mask = bands == b
+            ax.scatter(y_true[mask], y_pred[mask], s=4, alpha=0.4,
+                       color=col, label=label)
+        lo, hi = y_true.min(), y_true.max()
+        ax.plot([lo, hi], [lo, hi], 'k--', linewidth=1.5, label='1:1')
+        ax.set_xlabel('y_true (H̅)')
+        ax.set_ylabel('y_pred (H̅)')
+        ax.set_title('Scatter: pred vs true')
+        ax.legend(fontsize=7, markerscale=3)
+        ax.grid(True, alpha=0.3)
+
+        # --- Panel 2: Residual vs y_true ---
+        ax = axes[1]
+        for b, (label, col) in enumerate(zip(band_labels, colors_band)):
+            mask = bands == b
+            ax.scatter(y_true[mask], residual[mask], s=4, alpha=0.4, color=col)
+        ax.axhline(0, color='red', linewidth=1.5, linestyle='--')
+        # Running mean sorted by y_true
+        sort_idx = np.argsort(y_true)
+        win = max(1, len(y_true) // 50)
+        running_mean = np.convolve(residual[sort_idx], np.ones(win)/win, mode='same')
+        ax.plot(y_true[sort_idx], running_mean, color='black', linewidth=2, label='running mean')
+        ax.set_xlabel('y_true (H̅)')
+        ax.set_ylabel('y_pred − y_true (residual)')
+        ax.set_title('Residual vs level')
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+        # --- Panel 3: Bias stats table by band ---
+        ax = axes[2]
+        ax.axis('off')
+        rows = []
+        for b, label in enumerate(band_labels):
+            mask = bands == b
+            if mask.sum() == 0:
+                continue
+            n    = mask.sum()
+            bias = residual[mask].mean()
+            mae  = np.abs(residual[mask]).mean()
+            rel  = bias / np.maximum(y_true[mask].mean(), 1e-6) * 100
+            rows.append([label, f"{n}", f"{bias:+.2f}", f"{mae:.2f}", f"{rel:+.1f}%"])
+
+        overall_bias = residual.mean()
+        overall_mae  = np.abs(residual).mean()
+        rows.append(['ALL', f"{len(y_true)}", f"{overall_bias:+.2f}",
+                     f"{overall_mae:.2f}", f"{overall_bias/max(y_true.mean(),1e-6)*100:+.1f}%"])
+
+        col_labels = ['Band', 'N', 'Bias\n(pred−true)', 'MAE', 'Rel.Bias']
+        tbl = ax.table(cellText=rows, colLabels=col_labels,
+                       loc='center', cellLoc='center')
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(9)
+        tbl.scale(1.1, 1.6)
+        ax.set_title('Bias by H̅ level', pad=12)
+
+        plt.tight_layout()
+        if export_file_name is not None:
+            path = f"{export_file_name}_{name.replace(' ', '_')}_diagnostic.png"
+            os.makedirs(os.path.dirname(export_file_name) or '.', exist_ok=True)
             plt.savefig(path, dpi=150)
             print(f"Saved: {path}")
         plt.show()
