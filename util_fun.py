@@ -417,6 +417,112 @@ def train_model_offline(x, y, x_test, y_test, testing_timestep, model, optimizer
     print(f" y_true shape: {y_true_out.shape}, y_pred shape: {y_pred_out.shape} , timestamp length: {len(testing_timestep)}")
 
     return y_true_out, y_pred_out, testing_timestep
+
+
+# ── Custom losses for heavy-tail regression (Phase 6b) ───────────────────────
+
+def weighted_mse_loss(pred, true):
+    """MSE weighted by target magnitude — emphasizes flood peaks (DenseWeight-style)."""
+    w = 1.0 + true / (true.mean() + EPSILON)
+    return (w * (pred - true) ** 2).mean()
+
+
+def quantile_loss(pred, true, tau):
+    """Pinball loss for quantile regression. tau=0.5 is median; tau=0.9 targets upper tail."""
+    err = true - pred
+    return torch.maximum(tau * err, (tau - 1.0) * err).mean()
+
+
+def asymmetric_mse_loss(pred, true, alpha=2.0):
+    """MSE with extra penalty when pred < true (undershoot). Safety-aligned for warnings."""
+    sq = (pred - true) ** 2
+    undershoot_mask = (pred < true).float()
+    return (sq * (1.0 + alpha * undershoot_mask)).mean()
+
+
+def train_model_offline_with_loss(x, y, x_test, y_test, testing_timestep,
+                                  model, optimizer, loss_fn,
+                                  batch_size=32, max_epoch=500, early_Stop_threshold=10,
+                                  verbose=False):
+    """
+    Same pipeline as train_model_offline but uses a callable loss_fn(pred, true) — no
+    hard-coded MSELoss. Used for Phase 6b loss ablation (weighted MSE, Huber, quantile,
+    asymmetric MSE). Global min-max normalization is unchanged.
+    """
+    from torch.utils.data import TensorDataset, DataLoader as DataLoader
+
+    x = np.array(x); y = np.array(y)
+    x_test = np.array(x_test); y_test = np.array(y_test)
+
+    # Global min-max normalization on X (per-feature) and y (single)
+    num_features = x.shape[-1]
+    x_flat = x.reshape(-1, num_features)
+    x_min = x_flat.min(axis=0); x_max = x_flat.max(axis=0)
+    x_range = x_max - x_min + EPSILON
+    x_scaled = (x - x_min) / x_range
+    x_test_scaled = (x_test - x_min) / x_range
+
+    y_min = y.reshape(-1).min(); y_max = y.reshape(-1).max()
+    y_range = y_max - y_min + EPSILON
+    y_scaled = (y - y_min) / y_range
+    y_test_scaled = (y_test - y_min) / y_range
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    x_train_t = torch.tensor(x_scaled,      dtype=torch.float32, device=device)
+    y_train_t = torch.tensor(y_scaled,      dtype=torch.float32, device=device)
+    x_test_t  = torch.tensor(x_test_scaled, dtype=torch.float32, device=device)
+    y_test_t  = torch.tensor(y_test_scaled, dtype=torch.float32, device=device)
+
+    train_dataset = TensorDataset(x_train_t, y_train_t)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+
+    best_val_loss = float("inf")
+    epochs_no_improve = 0
+    best_state = {k: v.clone().cpu() for k, v in model.state_dict().items()}
+
+    for epoch in range(1, max_epoch + 1):
+        model.train()
+        running_loss = 0.0
+        for xb, yb in train_loader:
+            xb = xb.to(device); yb = yb.to(device)
+            optimizer.zero_grad()
+            y_pred = model(xb)
+            loss = loss_fn(y_pred, yb)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item() * xb.size(0)
+        epoch_train_loss = running_loss / len(train_loader.dataset)
+
+        model.eval()
+        with torch.no_grad():
+            y_test_pred_scaled = model(x_test_t)
+            val_loss = loss_fn(y_test_pred_scaled, y_test_t).item()
+
+        if verbose:
+            print(f"Epoch {epoch}/{max_epoch}  TrainLoss={epoch_train_loss:.6f}  ValLoss={val_loss:.6f}")
+
+        if val_loss + 1e-12 < best_val_loss:
+            best_val_loss = val_loss
+            epochs_no_improve = 0
+            best_state = {k: v.clone().cpu() for k, v in model.state_dict().items()}
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= early_Stop_threshold:
+                if verbose:
+                    print(f"Early stopping at epoch {epoch}.")
+                break
+
+    model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
+    model.eval()
+    with torch.no_grad():
+        y_pred_scaled_final = model(x_test_t).cpu().numpy()
+
+    y_pred_unnorm = (y_pred_scaled_final * y_range) + y_min
+    y_true_unnorm = (y_test_t.cpu().numpy() * y_range) + y_min
+    return y_true_unnorm.reshape(-1), y_pred_unnorm.reshape(-1), testing_timestep
+
+
 ######################################################
 ################ Evaluating functions ##########
 ######################################################
@@ -834,6 +940,9 @@ def threshold_sweep_analysis(result_dict, n_thresholds=50,
     print(f"\n{'='*100}")
     print(f"Threshold Sweep Summary — Key Quantiles")
     print(f"{'='*100}")
+    print(f"Bias convention: + = pred OVER true (overshoot/over-warn)   "
+          f"− = pred UNDER true (undershoot/miss)")
+    print(f"For flood warning: overshoots are recoverable, undershoots cause missed warnings.")
     for q in key_quantiles:
         thr_q = np.quantile(y_true_ref, q)
         n_peaks = int((y_true_ref >= thr_q).sum())
