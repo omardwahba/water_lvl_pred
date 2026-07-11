@@ -32,7 +32,7 @@ x_test, y_test = uf.create_sequences(test_df.values.astype(np.float32), LOOKBACK
 ds = uf.RollingNormTimeSeriesDataset(x_test, y_test, H_BAR_INDEX, y_clip=5.0, scale_floor=None)
 
 print("=" * 78)
-print("PART A — legacy dataset (scale_floor=None, y_clip=5.0): where the clamp bound")
+print("PART A - legacy dataset (scale_floor=None, y_clip=5.0): where the clamp bound")
 print("=" * 78)
 
 n = len(ds)
@@ -73,7 +73,7 @@ for w in worst:
 
 print()
 print("=" * 78)
-print("PART B — pre-fix exported CSVs vs the ACTUAL observed gauge")
+print("PART B - pre-fix exported CSVs vs the ACTUAL observed gauge")
 print("=" * 78)
 
 obs = test_df["H_bar"]

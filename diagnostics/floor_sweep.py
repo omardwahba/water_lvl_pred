@@ -44,14 +44,14 @@ for floor in [None, 0.006, 0.05, 0.10, 0.15, 0.20, 0.30, 0.50]:
     ys = move / (s[:, None] + 1e-6)
     print(f"{str(floor):>8} {(ys > 10).mean():8.3%} {(ys[healthy] > 10).mean():20.3%} "
           f"{ys.max():10.1f} {np.quantile(ys, 0.999):8.1f}")
-print("* windows with std >= 0.1 — their binding is genuine dynamics, not degeneracy;")
+print("* windows with std >= 0.1 - their binding is genuine dynamics, not degeneracy;")
 print("  a well-sized floor leaves this column at its no-floor value (~1.0%).")
 
 s = np.maximum(stds, 0.15)
 ys = move / (s[:, None] + 1e-6)
 mask = ys > 10
 q99 = np.quantile(train[:, H], 0.99)
-print(f"\nwith floor=0.15: {mask.mean():.3%} of elements exceed 10-sigma — GENUINE moves:")
+print(f"\nwith floor=0.15: {mask.mean():.3%} of elements exceed 10-sigma - GENUINE moves:")
 print(f"  their raw levels: mean {y[mask].mean():.1f}, {(y[mask] >= q99).mean():.1%} >= train Q99 ({q99:.1f})")
 print(f"  their raw |moves|: mean {move[mask].mean():.2f}, max {move[mask].max():.2f}")
 print(f"  max |y_scaled| overall: {ys.max():.1f}  -> tripwire at 500 never binds on real data")
