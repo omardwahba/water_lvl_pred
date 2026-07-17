@@ -43,17 +43,33 @@ class RollingNormTimeSeriesDataset(Dataset):
       The model learns a centered, physically meaningful target regardless of absolute level.
 
     No data leakage: h_bar_ref and h_bar_scale both come only from the lookback X.
+    scale_floor is a train-set-derived constant (see compute_scale_floor) applied
+    uniformly — no per-window or future information enters the normalization.
+
+    scale_floor: minimum allowed lookback std. Flat 48h windows give std ≈ 0, which
+    explodes y_scaled (millions) and forced y_clip to bind on ~9% of targets —
+    censoring flood peaks and distorting the reconstructed ground truth. With the
+    floor in place y_clip stays sane and acts as a never-binding tripwire.
+    None = legacy behavior.
+
+    y_clip: symmetric clamp bound on y_scaled. Pass None to disable clipping
+    entirely (no clamp at all — measured identical to y_clip=500 when the
+    scale_floor is set, since the tripwire binds on 0% of real data).
 
     Returns (per sample):
-        x_scaled, y_scaled, h_bar_ref, h_bar_scale
-    Unscale: y_true = y_scaled * h_bar_scale + h_bar_ref
+        x_scaled, y_scaled, y_raw, h_bar_ref, h_bar_scale
+    y_raw is the UNSCALED target — metrics must be computed against it, never
+    against unscaled y_scaled (which may be clipped).
+    Unscale predictions: y_pred_true = y_pred_scaled * h_bar_scale + h_bar_ref
     """
-    def __init__(self, X_seq, y_seq, h_bar_index, epsilon=EPSILON, y_clip=5.0):
+    def __init__(self, X_seq, y_seq, h_bar_index, epsilon=EPSILON, y_clip=5.0,
+                 scale_floor=None):
         self.X_seq = torch.tensor(X_seq, dtype=torch.float32)
         self.y_seq = torch.tensor(y_seq, dtype=torch.float32)
         self.h_bar_index = h_bar_index
         self.epsilon = epsilon
         self.y_clip = y_clip
+        self.scale_floor = scale_floor
 
     def __len__(self):
         return len(self.X_seq)
@@ -71,13 +87,17 @@ class RollingNormTimeSeriesDataset(Dataset):
         # H_bar: last-value reference + lookback std scale (no leakage)
         h_bar_lookback = x_raw[:, self.h_bar_index]
         h_bar_ref   = h_bar_lookback[-1]                     # current observed level
-        h_bar_scale = h_bar_lookback.std() + self.epsilon    # lookback variability
+        h_bar_scale = h_bar_lookback.std()                   # lookback variability
+        if self.scale_floor is not None:
+            h_bar_scale = torch.clamp(h_bar_scale, min=self.scale_floor)
+        h_bar_scale = h_bar_scale + self.epsilon
 
         x_scaled[:, self.h_bar_index] = (h_bar_lookback - h_bar_ref) / h_bar_scale
         y_scaled = (y_raw - h_bar_ref) / h_bar_scale
-        y_scaled = torch.clamp(y_scaled, -self.y_clip, self.y_clip)
+        if self.y_clip is not None:
+            y_scaled = torch.clamp(y_scaled, -self.y_clip, self.y_clip)
 
-        return x_scaled, y_scaled, h_bar_ref, h_bar_scale
+        return x_scaled, y_scaled, y_raw, h_bar_ref, h_bar_scale
 
 
 class ZScoreNormTimeSeriesDataset(Dataset):
@@ -90,8 +110,9 @@ class ZScoreNormTimeSeriesDataset(Dataset):
     - Z-score centers on 0 with unit variance — a future spike is only a few stds away,
       keeping y_scaled in a stable range without hard clipping.
 
-    Returns same 4-tuple interface as RollingNormTimeSeriesDataset.
-    Unscale: y_true = y_scaled * h_bar_std + h_bar_mean
+    Returns same 5-tuple interface as RollingNormTimeSeriesDataset
+    (x_scaled, y_scaled, y_raw, ref, scale).
+    Unscale predictions: y_pred_true = y_pred_scaled * h_bar_std + h_bar_mean
     """
     def __init__(self, X_seq, y_seq, h_bar_index, epsilon=EPSILON):
         self.X_seq = torch.tensor(X_seq, dtype=torch.float32)
@@ -114,7 +135,7 @@ class ZScoreNormTimeSeriesDataset(Dataset):
         h_bar_std  = std_vals[self.h_bar_index]
         y_scaled = (y_raw - h_bar_mean) / h_bar_std
 
-        return x_scaled, y_scaled, h_bar_mean, h_bar_std
+        return x_scaled, y_scaled, y_raw, h_bar_mean, h_bar_std
 
 
 class PercentileNormTimeSeriesDataset(Dataset):
@@ -127,7 +148,8 @@ class PercentileNormTimeSeriesDataset(Dataset):
     Args:
         low_q / high_q: quantile bounds (default 0.05 / 0.95)
         y_clip: symmetric clamp bound on y_scaled (default 5.0)
-    Returns same 4-tuple interface as RollingNormTimeSeriesDataset.
+    Returns same 5-tuple interface as RollingNormTimeSeriesDataset
+    (x_scaled, y_scaled, y_raw, ref, scale).
     """
     def __init__(self, X_seq, y_seq, h_bar_index, epsilon=EPSILON,
                  low_q=0.05, high_q=0.95, y_clip=5.0):
@@ -154,9 +176,10 @@ class PercentileNormTimeSeriesDataset(Dataset):
         h_bar_min = min_vals[self.h_bar_index]
         h_bar_range = range_vals[self.h_bar_index]
         y_scaled = (y_raw - h_bar_min) / h_bar_range
-        y_scaled = torch.clamp(y_scaled, -self.y_clip, self.y_clip)
+        if self.y_clip is not None:
+            y_scaled = torch.clamp(y_scaled, -self.y_clip, self.y_clip)
 
-        return x_scaled, y_scaled, h_bar_min, h_bar_range
+        return x_scaled, y_scaled, y_raw, h_bar_min, h_bar_range
 
 
 def create_sequences(data, lookback, horizon, target_value_index, step = None):
@@ -194,13 +217,67 @@ def create_sequences(data, lookback, horizon, target_value_index, step = None):
           f"X shape: {np.array(X).shape}, y shape: {np.array(y).shape}")
 
     return np.array(X), np.array(y)
+
+
+def compute_scale_floor(X_seq, h_bar_index, quantile=0.10):
+    ''' Derive the minimum allowed lookback std from TRAIN sequences only.
+
+    Flat lookback windows (std ≈ 0) make (y - ref)/std explode, which forced
+    y_clip to censor ~9% of targets. Flooring the std at a low train-set
+    quantile keeps scaled targets bounded without censoring real dynamics.
+
+    Must be computed on the TRAIN X_seq and passed to BOTH train and test
+    datasets (a train-derived constant — no leakage). Do not tune the quantile
+    against test metrics.
+
+    Args:
+        X_seq (np.array): (n_windows, lookback, n_features) train input sequences.
+        h_bar_index (int): index of the H_bar feature.
+        quantile (float): quantile of per-window stds used as the floor.
+    Returns:
+        float: the scale floor.
+    '''
+    stds = X_seq[:, :, h_bar_index].std(axis=1, ddof=1)  # ddof=1 matches torch.std
+    floor = float(np.quantile(stds, quantile))
+    print(f"scale_floor = {floor:.6f} "
+          f"(q{quantile:.2f} of {len(stds)} train-window stds; median {np.median(stds):.4f})")
+    return floor
+
+
+def report_y_clip_binding(dataset, name=""):
+    ''' Tripwire check: fraction of targets where y_clip changes the value.
+
+    With a proper scale_floor this should be ≈ 0. If it grows, the floor is
+    mis-sized — investigate rather than let the clamp silently censor data.
+
+    Args:
+        dataset: any of the *NormTimeSeriesDataset classes (5-tuple interface).
+        name (str): label for the printout.
+    Returns:
+        float: fraction of horizon elements where the clamp binds.
+    '''
+    clip = getattr(dataset, "y_clip", None)
+    if clip is None:
+        print(f"y_clip binding{' [' + name + ']' if name else ''}: "
+              f"no clip configured (y_clip=None) — nothing can bind")
+        return 0.0
+    bound = total = 0
+    for i in range(len(dataset)):
+        _, y_scaled, y_raw, ref, scale = dataset[i]
+        y_unclipped = (y_raw - ref) / scale
+        bound += int((y_unclipped.abs() > clip).sum())
+        total += y_scaled.numel()
+    frac = bound / total
+    print(f"y_clip binding{' [' + name + ']' if name else ''}: "
+          f"{bound}/{total} elements ({frac:.4%})")
+    return frac
 ######################################################
 ################ Training Functions ###################
 #######################################################
 def train_model_online(model, optimizer, criterion,
                        dataset, df,
                        LOOKBACK, HORIZON, batch_size,
-                       max_grad_norm=None,
+                       max_grad_norm=1.0,
                        use_amnesia_strategy=False, amnesia_threshold=2.5, amnesia_warmup_batches=10,
                        amnesia_new_lr=None,
                        amnesia_reset_lr=None,
@@ -210,7 +287,8 @@ def train_model_online(model, optimizer, criterion,
     train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
     num_batches = len(train_loader)
     y_ground_truth, y_predictions = np.array([0.0]).reshape(1,1), np.array([0.0]).reshape(1,1)
-    all_indices, batch_losses = np.array(['']), []
+    # object dtype: placeholder must concatenate with str or datetime indices alike
+    all_indices, batch_losses = np.array([''], dtype=object), []
 
     # --- NEW: Setup for Amnesia Strategy ---
     running_avg_loss, ema_alpha = 0.0, 0.1
@@ -223,14 +301,15 @@ def train_model_online(model, optimizer, criterion,
                   f"Warmup: {amnesia_warmup_batches} batches)")
     
     model.train()
-    for i, (x_batch_scaled, y_batch_scaled, h_min, h_range) in enumerate(train_loader):
+    for i, (x_batch_scaled, y_batch_scaled, y_batch_raw, h_min, h_range) in enumerate(train_loader):
         # --- Training Step ---
         y_pred_scaled = model(x_batch_scaled)
-        
-        # --- Data Unscaling & Storage (Original) ---
+
+        # --- Data Unscaling & Storage ---
         h_range_u, h_min_u = h_range.unsqueeze(-1), h_min.unsqueeze(-1)
         y_pred_true = (y_pred_scaled * h_range_u + h_min_u).detach().cpu().numpy()
-        y_unscaled =  (y_batch_scaled * h_range_u + h_min_u).detach().cpu().numpy()
+        # ground truth = raw observations, NOT unscaled y_batch_scaled (may be clipped)
+        y_unscaled = y_batch_raw.detach().cpu().numpy()
         y_predictions = np.concatenate((y_predictions, y_pred_true), axis=1)
         y_ground_truth = np.concatenate((y_ground_truth, y_unscaled), axis=1)
         idx_start, idx_end = (i*HORIZON) + LOOKBACK, (i*HORIZON) + LOOKBACK + HORIZON
@@ -544,16 +623,18 @@ def model_evaluate_with_norm(model,criterion ,
     with torch.no_grad():
         test_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
         y_ground_truth, y_predictions = np.array([0.0]).reshape(1,1), np.array([0.0]).reshape(1,1)
-        all_indices, batch_losses = np.array(['']), []
+        # object dtype: placeholder must concatenate with str or datetime indices alike
+        all_indices, batch_losses = np.array([''], dtype=object), []
 
-        for i, (x_batch_scaled, y_batch_scaled, h_min, h_range) in enumerate(test_loader):
+        for i, (x_batch_scaled, y_batch_scaled, y_batch_raw, h_min, h_range) in enumerate(test_loader):
             # get predictions
             y_pred_scaled = model(x_batch_scaled)
-            
-            # --- Data Unscaling & Storage (Original) ---
+
+            # --- Data Unscaling & Storage ---
             h_range_u, h_min_u = h_range.unsqueeze(-1), h_min.unsqueeze(-1)
             y_pred_true = (y_pred_scaled * h_range_u + h_min_u).detach().cpu().numpy()
-            y_unscaled =  (y_batch_scaled * h_range_u + h_min_u).detach().cpu().numpy()
+            # ground truth = raw observations, NOT unscaled y_batch_scaled (may be clipped)
+            y_unscaled = y_batch_raw.detach().cpu().numpy()
             y_predictions = np.concatenate((y_predictions, y_pred_true), axis=1)
             y_ground_truth = np.concatenate((y_ground_truth, y_unscaled), axis=1)
             idx_start, idx_end = (i*horizon) + lookback, (i*horizon) + lookback + horizon
