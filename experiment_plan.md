@@ -94,6 +94,49 @@ Upgrade the amnesia strategy to be drift-aware rather than loss-spike-reactive.
 
 ---
 
+## Phase 5 — Peak Threshold Sweep (winner vs solution) — DONE 2026-07-18
+
+Evaluate the winning optimizer (FTRL-default) under the fixed pipeline ("the solution":
+`scale_floor` q0.15 + no-clip/tripwire + honest ground truth) across peak thresholds,
+counting peaks detected at each threshold.
+
+- [x] **5.1 Threshold sweep Q50→Q100** — `peak_threshold_sweep.py` →
+  `results/testing/online_fixed/peak_threshold_sweep.csv`
+  - Headline: detection 96% @Q50 → 70% @Q90 → 50–58% @Q97–98; peak-magnitude bias
+    (undershoot) grows monotonically −8 @Q50 → −25 to −33 raw units at Q97+.
+    Undershoot persists on the UNCENSORED pipeline → real model behavior, not a
+    clipping artifact. FTRL/RMSprop/Adam detect nearly identically (±1 event) —
+    aggregate-RMSE winner ≠ better event detector.
+  - **Objective:** quantify how peak detection degrades as the flood threshold rises —
+    where does the model stop "seeing" peaks?
+  - **Hypothesis:** detected-peak count tracks observed count at low thresholds and
+    falls off at high quantiles due to the known undershoot at extreme levels.
+  - **Inputs/config:** predictions `results/testing/online_fixed/online_fixed_FTRL-default.csv`
+    (already exported — no retraining needed); truth = raw observed H_bar from
+    `dataset/one_station_test_data.csv`; thresholds = train-set quantiles **Q50 through Q100**
+    in steps of 5 (Q50=148.0 … Q99=186.6 … Q100=462.7).
+    *Assumption to confirm: "50 to 100" = percentile thresholds. Raw units 50–100 are below
+    the data minimum (130), which would make every hour a trivial "peak".*
+  - **Metric:** number of peaks at each threshold — an observed peak = a contiguous run of
+    `y_true >= threshold`; it counts as detected if `y_pred >= threshold` at any hour of
+    that run. Report observed count, detected count, and detection rate.
+  - **Expected output:** table `threshold_quantile -> (threshold_value, peaks_observed,
+    peaks_detected, detection_rate)` exported as CSV, e.g.
+    `results/testing/online_fixed/peak_threshold_sweep_FTRL.csv`.
+  - **Implementation plan (run later):** small script or notebook cell — load the two CSVs,
+    join on timestamp (see `diagnostics/clip_proof.py` Part B for the join pattern), find
+    contiguous runs above each threshold on truth, check predictions within each run.
+    `uf.peak_analysis()` (util_fun.py) already computes single-threshold peak metrics and
+    can be looped, but it thresholds on quantiles of `y_true` and reports RMSE-style
+    metrics, not event counts — the run/count logic is the missing piece (~40 lines).
+  - **Dependencies/missing pieces:** none blocking — data and predictions exist; needs the
+    event-counting helper; decide tie-breaking for runs shorter than N hours (suggest
+    minimum run length = 3 h to avoid single-sample noise "peaks").
+  - **Status:** planned / not completed — no results yet; do not cite numbers from this
+    phase until run.
+
+---
+
 ## Priority Order
 
 ```text
