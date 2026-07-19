@@ -101,12 +101,16 @@ Evaluate the winning optimizer (FTRL-default) under the fixed pipeline ("the sol
 counting peaks detected at each threshold.
 
 - [x] **5.1 Threshold sweep Q50→Q100** — `peak_threshold_sweep.py` →
-  `results/testing/online_fixed/peak_threshold_sweep.csv`
-  - Headline: detection 96% @Q50 → 70% @Q90 → 50–58% @Q97–98; peak-magnitude bias
-    (undershoot) grows monotonically −8 @Q50 → −25 to −33 raw units at Q97+.
+  `results/testing/online_fixed/peak_threshold_sweep.csv`; figures via
+  `plot_peak_sweep.py` → `results/figures/peak_sweep_{summary,timeline}.png`
+  - Headline: detection 97% @Q50 → 70% @Q90 → 50–58% @Q97–98; peak-magnitude bias
+    (undershoot) grows monotonically −6 @Q50 → −25 to −33 raw units at Q97+.
     Undershoot persists on the UNCENSORED pipeline → real model behavior, not a
     clipping artifact. FTRL/RMSprop/Adam detect nearly identically (±1 event) —
     aggregate-RMSE winner ≠ better event detector.
+  - Events split at temporal data gaps (test set is non-contiguous). Data discovery:
+    the split is BY YEAR — test = 2008 + 2014, train = 2009–13, 2015, 2018–19
+    (same station, disjoint years → no temporal overlap between train and test).
   - **Objective:** quantify how peak detection degrades as the flood threshold rises —
     where does the model stop "seeing" peaks?
   - **Hypothesis:** detected-peak count tracks observed count at low thresholds and

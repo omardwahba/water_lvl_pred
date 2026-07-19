@@ -32,9 +32,26 @@ MIN_RUN_HOURS = 3   # an event must persist >= 3 h (filters single-sample noise)
 
 train_h = pd.read_csv("dataset/one_station_train_data.csv", index_col=0)["H_bar"].values
 
-def find_events(mask, min_len=MIN_RUN_HOURS):
-    """Contiguous True-runs of mask as (start, end_exclusive), length >= min_len."""
-    edges = np.flatnonzero(np.diff(np.concatenate(([0], mask.astype(np.int8), [0]))))
+def find_events(mask, times=None, min_len=MIN_RUN_HOURS):
+    """Contiguous True-runs of mask as (start, end_exclusive), length >= min_len.
+
+    If hourly timestamps are given, runs are also split at temporal gaps > 1 h —
+    the test set is non-contiguous (years 2008 + 2014, plus 6 short sensor gaps),
+    so positional adjacency alone could merge events across real time jumps.
+    """
+    m = mask.astype(np.int8).copy()
+    if times is not None:
+        gap_after = np.flatnonzero(np.diff(times) > np.timedelta64(1, "h"))
+        edges = np.flatnonzero(np.diff(np.concatenate(([0], m, [0]))))
+        runs = edges.reshape(-1, 2)
+        out = []
+        for s, e in runs:
+            cuts = [g + 1 for g in gap_after if s <= g < e - 1]
+            for a, b in zip([s] + cuts, cuts + [e]):
+                if b - a >= min_len:
+                    out.append((a, b))
+        return out
+    edges = np.flatnonzero(np.diff(np.concatenate(([0], m, [0]))))
     return [(s, e) for s, e in edges.reshape(-1, 2) if e - s >= min_len]
 
 frames = {}
@@ -46,11 +63,12 @@ for m in MODELS:
 
 ref = frames["FTRL-default"]
 y_true = ref["True"].values  # verified == raw gauge
+t_ref = ref["Timestamp"].values
 
 rows = []
 for q in QUANTILES:
     thr = float(np.quantile(train_h, q))
-    events = find_events(y_true >= thr)
+    events = find_events(y_true >= thr, times=t_ref)
     row = {"quantile": q, "threshold": round(thr, 2), "peaks_observed": len(events)}
     for m, df in frames.items():
         y_pred = df["Prediction"].values
