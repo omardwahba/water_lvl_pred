@@ -271,6 +271,96 @@ def report_y_clip_binding(dataset, name=""):
     print(f"y_clip binding{' [' + name + ']' if name else ''}: "
           f"{bound}/{total} elements ({frac:.4%})")
     return frac
+
+
+def find_events(mask, times=None, min_len=3):
+    ''' Contiguous True-runs of mask as (start, end_exclusive), length >= min_len.
+
+    If hourly timestamps are given, runs are also split at temporal gaps > 1 h --
+    the datasets are non-contiguous (year-based split plus short sensor gaps), so
+    positional adjacency alone could merge events across real time jumps.
+    '''
+    m = np.asarray(mask).astype(np.int8)
+    edges = np.flatnonzero(np.diff(np.concatenate(([0], m, [0]))))
+    runs = edges.reshape(-1, 2)
+    if times is None:
+        return [(s, e) for s, e in runs if e - s >= min_len]
+    gap_after = np.flatnonzero(np.diff(times) > np.timedelta64(1, "h"))
+    out = []
+    for s, e in runs:
+        cuts = [g + 1 for g in gap_after if s <= g < e - 1]
+        for a, b in zip([s] + cuts, cuts + [e]):
+            if b - a >= min_len:
+                out.append((a, b))
+    return out
+
+
+def peak_event_metrics(y_true, y_pred, times, thr, ref_levels, horizon=24, min_len=3):
+    ''' Event-level flood metrics at one threshold, on the flattened eval grid.
+
+    An observed event is a contiguous run of >= min_len hours with y_true >= thr
+    (split at data gaps). Three POD levels, strictest last:
+      pod            -- event counted as hit if y_pred >= thr at ANY event hour.
+                        Inflated by windows already in flood at issue time.
+      rising_pod     -- restricted to events that BEGAN below thr at issue time
+                        (ref_levels[start] < thr): the genuine forecast case.
+      aw_pod         -- advance-warning: hit only if some forecast hour j with
+                        y_pred[j] >= thr was issued while the river was still
+                        below thr (ref_levels[j] < thr) within [start-horizon,
+                        event end). A persistence-collapsed model scores ~0 here.
+    Also: far/csi (false alarm = predicted event overlapping no observed event),
+    mean_lead_h (hours between first advance warning's issue time and the
+    observed crossing, approximated to the window boundary, +-1 h), and
+    peak_bias (mean pred_max - true_max per event; negative = undershoot).
+
+    Args:
+        y_true, y_pred: flattened (n_windows * horizon,) raw-unit series.
+        times: matching datetime64 timestamps (for gap-aware events).
+        thr: threshold in raw units.
+        ref_levels: per-hour reference level = the issuing window's last lookback
+                    value repeated over its horizon (the persistence value).
+    Returns:
+        dict of the metrics above plus event counts.
+    '''
+    y_true = np.asarray(y_true, dtype=np.float64)
+    y_pred = np.asarray(y_pred, dtype=np.float64)
+    ref_levels = np.asarray(ref_levels, dtype=np.float64)
+
+    obs_ev = find_events(y_true >= thr, times, min_len)
+    prd_ev = find_events(y_pred >= thr, times, min_len)
+
+    hits = [(s, e) for s, e in obs_ev if y_pred[s:e].max() >= thr]
+    misses = len(obs_ev) - len(hits)
+    fa = sum(1 for ps, pe in prd_ev
+             if not any(not (pe <= s or ps >= e) for s, e in obs_ev))
+
+    rising = [(s, e) for s, e in obs_ev if ref_levels[s] < thr]
+    rising_hits = sum(1 for s, e in rising if y_pred[s:e].max() >= thr)
+
+    warn = (y_pred >= thr) & (ref_levels < thr)   # exceedance forecast issued below thr
+    aw_hits, leads = 0, []
+    for s, e in obs_ev:
+        lo = max(0, s - horizon)
+        idx = np.flatnonzero(warn[lo:e]) + lo
+        if len(idx):
+            aw_hits += 1
+            issue = (idx[0] // horizon) * horizon - 1   # window issue hour (approx)
+            leads.append(max(0, s - issue))
+
+    n = len(obs_ev)
+    return dict(
+        threshold=thr, n_events=n, hits=len(hits), misses=misses, false_alarms=fa,
+        pod=len(hits) / n if n else np.nan,
+        far=fa / len(prd_ev) if prd_ev else 0.0,
+        csi=len(hits) / (len(hits) + misses + fa) if (len(hits) + misses + fa) else np.nan,
+        n_rising=len(rising),
+        rising_pod=rising_hits / len(rising) if rising else np.nan,
+        aw_hits=aw_hits,
+        aw_pod=aw_hits / n if n else np.nan,
+        mean_lead_h=float(np.mean(leads)) if leads else np.nan,
+        peak_bias=float(np.mean([y_pred[s:e].max() - y_true[s:e].max()
+                                 for s, e in obs_ev])) if n else np.nan,
+    )
 ######################################################
 ################ Training Functions ###################
 #######################################################
@@ -278,10 +368,14 @@ def train_model_online(model, optimizer, criterion,
                        dataset, df,
                        LOOKBACK, HORIZON, batch_size,
                        max_grad_norm=1.0,
+                       loss_space="scaled",
                        use_amnesia_strategy=False, amnesia_threshold=2.5, amnesia_warmup_batches=10,
                        amnesia_new_lr=None,
                        amnesia_reset_lr=None,
                        silent=False):
+
+    if loss_space not in ("scaled", "raw"):
+        raise ValueError(f"loss_space must be 'scaled' or 'raw', got {loss_space!r}")
 
     # --- Setup from original function ---
     train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
@@ -315,8 +409,15 @@ def train_model_online(model, optimizer, criterion,
         idx_start, idx_end = (i*HORIZON) + LOOKBACK, (i*HORIZON) + LOOKBACK + HORIZON
         all_indices = np.concatenate((all_indices, df.index[idx_start:idx_end]))
 
-        # 2. Calculate loss (on scaled data)
-        loss = criterion(y_pred_scaled, y_batch_scaled)
+        # 2. Calculate loss
+        if loss_space == "raw":
+            # raw-unit MSE == scaled-space MSE weighted by scale^2.
+            # Undoes the implicit 1/scale^2 weighting of per-window normalization
+            # (normalization_deep_dive.md section 5): flood-window errors regain
+            # full weight instead of being discounted ~270x vs calm windows.
+            loss = criterion(y_pred_scaled * h_range_u, y_batch_scaled * h_range_u)
+        else:
+            loss = criterion(y_pred_scaled, y_batch_scaled)  # scaled space (legacy)
         current_loss = loss.item()
         batch_losses.append(current_loss)
 
