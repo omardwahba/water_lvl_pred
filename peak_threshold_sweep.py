@@ -24,6 +24,9 @@ os.chdir(ROOT)
 import numpy as np
 import pandas as pd
 
+import util_fun as uf
+
+LOOKBACK, HORIZON, H_BAR_INDEX = 48, 24, 3
 FIXED_DIR = "results/testing/online_fixed"
 MODELS = ["FTRL-default", "RMSprop", "Adam-default"]
 QUANTILES = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90,
@@ -32,27 +35,14 @@ MIN_RUN_HOURS = 3   # an event must persist >= 3 h (filters single-sample noise)
 
 train_h = pd.read_csv("dataset/one_station_train_data.csv", index_col=0)["H_bar"].values
 
-def find_events(mask, times=None, min_len=MIN_RUN_HOURS):
-    """Contiguous True-runs of mask as (start, end_exclusive), length >= min_len.
+# Persistence reference level per hour: the issuing window's last lookback value.
+# Needed for rising-limb / advance-warning POD and the persistence baseline column.
+test_df = pd.read_csv("dataset/one_station_test_data.csv", parse_dates=[0], index_col=0)
+x_test, _ = uf.create_sequences(test_df.values.astype(np.float32),
+                                LOOKBACK, HORIZON, H_BAR_INDEX)
+ref_levels = np.repeat(x_test[:, -1, H_BAR_INDEX].astype(np.float64), HORIZON)
 
-    If hourly timestamps are given, runs are also split at temporal gaps > 1 h —
-    the test set is non-contiguous (years 2008 + 2014, plus 6 short sensor gaps),
-    so positional adjacency alone could merge events across real time jumps.
-    """
-    m = mask.astype(np.int8).copy()
-    if times is not None:
-        gap_after = np.flatnonzero(np.diff(times) > np.timedelta64(1, "h"))
-        edges = np.flatnonzero(np.diff(np.concatenate(([0], m, [0]))))
-        runs = edges.reshape(-1, 2)
-        out = []
-        for s, e in runs:
-            cuts = [g + 1 for g in gap_after if s <= g < e - 1]
-            for a, b in zip([s] + cuts, cuts + [e]):
-                if b - a >= min_len:
-                    out.append((a, b))
-        return out
-    edges = np.flatnonzero(np.diff(np.concatenate(([0], m, [0]))))
-    return [(s, e) for s, e in edges.reshape(-1, 2) if e - s >= min_len]
+find_events = uf.find_events   # gap-aware, shared implementation
 
 frames = {}
 for m in MODELS:
@@ -65,19 +55,33 @@ ref = frames["FTRL-default"]
 y_true = ref["True"].values  # verified == raw gauge
 t_ref = ref["Timestamp"].values
 
+assert len(ref_levels) == len(y_true), "reference-level grid mismatch"
+
 rows = []
 for q in QUANTILES:
     thr = float(np.quantile(train_h, q))
-    events = find_events(y_true >= thr, times=t_ref)
+    events = find_events(y_true >= thr, times=t_ref, min_len=MIN_RUN_HOURS)
     row = {"quantile": q, "threshold": round(thr, 2), "peaks_observed": len(events)}
+
+    # Persistence baseline on the same event metric: predicting "no change" still
+    # "detects" any event whose issuing window was already at/above threshold.
+    row["detected_persistence"] = sum(1 for s, e in events
+                                      if ref_levels[s:e].max() >= thr)
+    row["rate_persistence"] = (row["detected_persistence"] / len(events)
+                               if events else np.nan)
+
     for m, df in frames.items():
         y_pred = df["Prediction"].values
-        detected = sum(1 for s, e in events if y_pred[s:e].max() >= thr)
-        bias = (np.mean([y_pred[s:e].max() - y_true[s:e].max() for s, e in events])
-                if events else np.nan)
-        row[f"detected_{m}"] = detected
-        row[f"rate_{m}"] = detected / len(events) if events else np.nan
-        row[f"peak_bias_{m}"] = round(bias, 2) if events else np.nan
+        pm = uf.peak_event_metrics(y_true, y_pred, t_ref, thr, ref_levels,
+                                   horizon=HORIZON, min_len=MIN_RUN_HOURS)
+        row[f"detected_{m}"] = pm["hits"]
+        row[f"rate_{m}"] = pm["pod"]
+        row[f"rising_pod_{m}"] = pm["rising_pod"]
+        row[f"aw_pod_{m}"] = pm["aw_pod"]          # advance warning: the honest one
+        row[f"far_{m}"] = pm["far"]
+        row[f"csi_{m}"] = pm["csi"]
+        row[f"peak_bias_{m}"] = (round(pm["peak_bias"], 2)
+                                 if not np.isnan(pm["peak_bias"]) else np.nan)
     rows.append(row)
 
 out = pd.DataFrame(rows)
@@ -85,24 +89,34 @@ os.makedirs(FIXED_DIR, exist_ok=True)
 out_path = f"{FIXED_DIR}/peak_threshold_sweep.csv"
 out.to_csv(out_path, index=False)
 
-# --- Report: full table for the winner, then detection-rate comparison ---
+# --- Report: full table for the winner, incl. baseline + falsifiable columns ---
 w = "FTRL-default"
-print(f"\nPhase 5.1 — peak threshold sweep | winner = {w} | fixed pipeline")
-print(f"event = contiguous hours with observed >= threshold, min {MIN_RUN_HOURS} h")
-print(f"\n{'Q':>6} {'thr':>8} {'observed':>9} {'detected':>9} {'rate':>7} {'peak bias':>10}")
-print("-" * 55)
+print(f"\nPhase 5.1 -- peak threshold sweep | winner = {w} | fixed pipeline")
+print(f"event = contiguous hours with observed >= threshold, min {MIN_RUN_HOURS} h "
+      f"(split at data gaps)")
+print("POD = any-hour detection (inflated by already-in-flood windows); "
+      "rising = events that began below thr;")
+print("AW = advance warning (forecast issued while still below thr) -- "
+      "the only genuine-forecast column")
+print(f"\n{'Q':>6} {'thr':>8} {'obs':>5} {'POD':>6} {'persist':>8} {'rising':>7} "
+      f"{'AW':>6} {'FAR':>6} {'CSI':>6} {'peak bias':>10}")
+print("-" * 78)
 for r in rows:
-    rate = f"{r[f'rate_{w}']:.0%}" if r["peaks_observed"] else "  —"
-    bias = f"{r[f'peak_bias_{w}']:+.2f}" if r["peaks_observed"] else "   —"
-    print(f"{r['quantile']:>6} {r['threshold']:>8.2f} {r['peaks_observed']:>9} "
-          f"{r[f'detected_{w}']:>9} {rate:>7} {bias:>10}")
+    if not r["peaks_observed"]:
+        print(f"{r['quantile']:>6} {r['threshold']:>8.2f} {0:>5}   -- no events --")
+        continue
+    print(f"{r['quantile']:>6} {r['threshold']:>8.2f} {r['peaks_observed']:>5} "
+          f"{r[f'rate_{w}']:>6.0%} {r['rate_persistence']:>8.0%} "
+          f"{r[f'rising_pod_{w}']:>7.0%} {r[f'aw_pod_{w}']:>6.0%} "
+          f"{r[f'far_{w}']:>6.2f} {r[f'csi_{w}']:>6.2f} {r[f'peak_bias_{w}']:>+10.2f}")
 
-print(f"\nDetection-rate comparison (observed peaks in parentheses):")
-print(f"{'Q':>6} " + " ".join(f"{m:>14}" for m in frames))
+print("\nPOD comparison -- models vs persistence baseline (events in parentheses):")
+print(f"{'Q':>6} " + " ".join(f"{m:>14}" for m in frames) + f"{'persistence':>14}")
 for r in rows:
     if not r["peaks_observed"]:
         continue
     cells = " ".join(f"{r[f'rate_{m}']:>13.0%} " for m in frames)
-    print(f"{r['quantile']:>6} {cells}  ({r['peaks_observed']})")
+    print(f"{r['quantile']:>6} {cells}{r['rate_persistence']:>13.0%}   "
+          f"({r['peaks_observed']})")
 
 print(f"\nExported: {out_path}")
