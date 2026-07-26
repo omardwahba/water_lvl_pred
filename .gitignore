@@ -1,2 +1,15 @@
-/__pycache__
-/cstm_models/__pycache__
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Experiment outputs — regenerated on every run, no need to track
+results/
+*.png
+*.html
+
+# Allow committing specific final figures if needed:
+#   git add -f path/to/final_figure.png
